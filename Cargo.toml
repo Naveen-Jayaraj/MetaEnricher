@@ -1,0 +1,29 @@
+[package]
+name = "meta_enricher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5" }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-full", "limit"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1.11"
+strsim = "0.11"
+moka = { version = "0.12", features = ["future"] }
+futures = "0.3"
+urlencoding = "2.1"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

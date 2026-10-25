@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: meta-enricher
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
