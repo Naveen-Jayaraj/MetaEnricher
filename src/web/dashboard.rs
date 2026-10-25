@@ -526,10 +526,15 @@ const DASHBOARD_HTML: &str = r###"<!DOCTYPE html>
           <div style="font-size:0.8rem; color:var(--text-muted);">High-Performance OfflineMusic Server &bull; Wilooper/Lyrica Synced Engine</div>
         </div>
       </div>
-      <div style="display:flex; align-items:center; gap:12px;">
+      <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <div style="display:flex; align-items:center; gap:8px; background:rgba(255,255,255,0.06); padding:6px 12px; border-radius:var(--radius-sm); border:1px solid var(--border);">
+          <span style="font-size:0.75rem; color:var(--text-muted); font-weight:600;">API KEY:</span>
+          <input type="password" id="global-api-key" style="background:transparent; border:none; color:#a5b4fc; font-family:var(--mono); font-size:0.8rem; outline:none; width:170px;" placeholder="metaenricher_secret_key" oninput="saveApiKey(this.value)">
+          <button onclick="toggleKeyVisibility()" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:0.75rem;" title="Toggle Visibility">👁️</button>
+        </div>
         <span class="status-badge">
           <span class="status-dot"></span>
-          Engine Online (v0.1.0)
+          Engine Online &amp; Protected
         </span>
       </div>
     </header>
@@ -769,8 +774,20 @@ const DASHBOARD_HTML: &str = r###"<!DOCTYPE html>
           </table>
         </div>
 
-        <h4 style="color:#a5b4fc; margin-bottom:8px;">2. OfflineMusic Android Kotlin Snippet</h4>
-        <pre><code>// Retrofit API Definition for OfflineMusic
+        <h4 style="color:#a5b4fc; margin-bottom:8px;">2. OfflineMusic Android Kotlin Snippet with Authorization</h4>
+        <pre><code>// 1. Configure OkHttpClient with Secret API Key (or Basic Auth)
+val okHttpClient = OkHttpClient.Builder()
+    .addInterceptor { chain ->
+        val original = chain.request()
+        val request = original.newBuilder()
+            .header("X-API-Key", "metaenricher_secret_key") // Your configured API_KEY
+            // Or Basic Auth: .header("Authorization", Credentials.basic("admin", "metaenricher_secret"))
+            .build()
+        chain.proceed(request)
+    }
+    .build()
+
+// 2. Retrofit API Definition
 interface MetaEnricherApi {
     @PUT("song")
     suspend fun enrichSong(@Body track: TrackEntity): SingleSongResponse
@@ -783,9 +800,16 @@ interface MetaEnricherApi {
 
     @PUT("lyrics")
     suspend fun getLyricsBatch(@Body queries: List&lt;LyricQuery&gt;): BatchLyricResponse
+
+    @GET("lyric/file")
+    suspend fun downloadLrc(
+        @Query("title") title: String, 
+        @Query("artist") artist: String,
+        @Query("key") apiKey: String = "metaenricher_secret_key"
+    ): okhttp3.ResponseBody
 }
 
-// In your Repository or Worker:
+// 3. In your Repository or Worker:
 val enriched = api.enrichSong(trackEntity)
 if (enriched.success) {
     trackDao.updateTrack(enriched.song) // Saves metachecked=true, CONFIRMED status, canonical " / " artists
@@ -833,6 +857,37 @@ if (enriched.success) {
       }
     }
 
+    // Security & API Key Helpers
+    function getApiKey() {
+      return localStorage.getItem('metaenricher_api_key') || 'metaenricher_secret_key';
+    }
+
+    function saveApiKey(val) {
+      localStorage.setItem('metaenricher_api_key', val.trim());
+    }
+
+    function toggleKeyVisibility() {
+      const el = document.getElementById('global-api-key');
+      el.type = el.type === 'password' ? 'text' : 'password';
+    }
+
+    document.getElementById('global-api-key').value = getApiKey();
+
+    async function secureFetch(url, options = {}) {
+      options.headers = options.headers || {};
+      options.headers['X-API-Key'] = getApiKey();
+      const res = await fetch(url, options);
+      if (res.status === 401) {
+        alert("Unauthorized (401)! Please enter the correct API Key in the top header bar.");
+        throw new Error("Unauthorized");
+      }
+      if (res.status === 429) {
+        alert("Rate Limit Exceeded (429)! MetaEnricher allows up to 60 requests/minute. Please wait a moment.");
+        throw new Error("Rate limit exceeded");
+      }
+      return res;
+    }
+
     // Single Song Enricher
     async function runSingleEnrich() {
       const btn = document.getElementById('btn-enrich');
@@ -849,7 +904,7 @@ if (enriched.success) {
       };
 
       try {
-        const res = await fetch('/song', {
+        const res = await secureFetch('/song', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
@@ -935,7 +990,7 @@ if (enriched.success) {
       btn.innerHTML = '<span class="loader"></span> Fetching...';
 
       try {
-        const res = await fetch('/lyric', {
+        const res = await secureFetch('/lyric', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ title, artist })
@@ -1065,7 +1120,7 @@ if (enriched.success) {
       try {
         const raw = document.getElementById('batch-input').value;
         const tracks = JSON.parse(raw);
-        const res = await fetch('/songs', {
+        const res = await secureFetch('/songs', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(tracks)
@@ -1089,7 +1144,7 @@ if (enriched.success) {
       try {
         const raw = document.getElementById('batch-input').value;
         const tracks = JSON.parse(raw);
-        const res = await fetch('/lyrics', {
+        const res = await secureFetch('/lyrics', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(tracks)

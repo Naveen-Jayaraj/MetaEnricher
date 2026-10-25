@@ -1,14 +1,17 @@
 mod handlers;
 mod models;
+mod security;
 mod services;
 mod web;
 
 use axum::{
     extract::DefaultBodyLimit,
+    middleware::from_fn_with_state,
     routing::{get, put},
     Router,
 };
 use handlers::*;
+use security::{security_middleware, SecurityConfig};
 use services::{LyricsAggregator, MetadataEnricher};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
@@ -25,6 +28,7 @@ pub struct AppState {
     pub start_time: Instant,
     pub total_song_requests: Arc<AtomicU64>,
     pub total_lyric_requests: Arc<AtomicU64>,
+    pub security: Arc<SecurityConfig>,
 }
 
 #[tokio::main]
@@ -42,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
 
     let lyrics_aggregator = Arc::new(LyricsAggregator::new());
     let metadata_enricher = Arc::new(MetadataEnricher::new(lyrics_aggregator.clone()));
+    let security_config = Arc::new(SecurityConfig::from_env());
 
     let app_state = AppState {
         enricher: metadata_enricher,
@@ -49,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
         start_time: Instant::now(),
         total_song_requests: Arc::new(AtomicU64::new(0)),
         total_lyric_requests: Arc::new(AtomicU64::new(0)),
+        security: security_config,
     };
 
     // Configure CORS so Android app and browser client can connect without restrictions
@@ -83,6 +89,8 @@ async fn main() -> anyhow::Result<()> {
         // Health & Telemetry
         .route("/health", get(health_handler))
         .route("/api/health", get(health_handler))
+        // Security middleware: Rate limiting + API Key / Basic Auth validation
+        .layer(from_fn_with_state(app_state.clone(), security_middleware))
         .layer(DefaultBodyLimit::max(15 * 1024 * 1024)) // 15MB request limit
         .layer(cors)
         .layer(TraceLayer::new_for_http())

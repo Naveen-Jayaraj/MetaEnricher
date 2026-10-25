@@ -5,3 +5,12 @@ services:
     plan: free
     dockerfilePath: ./Dockerfile
     autoDeploy: true
+    envVars:
+      - key: API_KEY
+        value: metaenricher_secret_key
+      - key: AUTH_USERNAME
+        value: admin
+      - key: AUTH_PASSWORD
+        value: metaenricher_secret
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "60"
