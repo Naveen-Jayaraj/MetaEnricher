@@ -1,6 +1,6 @@
 # Multi-stage ultra-lightweight Dockerfile for MetaEnricher
 # Stage 1: Build binary
-FROM rust:1.80-slim as builder
+FROM rust:1-slim as builder
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
