@@ -1,171 +1,132 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
-static BRACKET_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\s*[\(\[\{][^\)\]\}]*(?:video|audio|visualizer|lyrics|lyric|remaster(?:ed)?|clean|explicit|4k|60fps|hd|hq|extended|radio\s*edit|live)[^\)\]\}]*[\)\]\}]\s*")
-        .unwrap()
-});
-
-static UNMATCHED_BRACKETS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[\(\[\{][^\)\]\}]*$|^[^\(\[\{]*[\)\]\}]").unwrap()
-});
-
-static FEAT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\s*[\(\[]?(?:feat\.?|ft\.?|featuring)\s+([^\)\]]+)[\)\]]?").unwrap()
-});
-
-static PIPE_SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\s*\|.*$").unwrap()
-});
-
-static FORMAT_EXTENSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+static FILE_EXTENSION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\.(?:mp3|flac|m4a|wav|aac|ogg|opus|webm|wma|alac|aiff|ape)$").unwrap()
 });
 
-static FORMAT_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\s*[\(\[\{]?(?:320\s*kbps|128\s*kbps|256\s*kbps|mp3|flac|lossless|cd\s*rip)[\)\]\}]?\s*").unwrap()
+static VIDEO_NOISE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\s*[(\[{]\s*(?:(?:official\s+)?(?:(?:music\s+|lyric[s]?\s+)?video|(?:clean\s+)?audio|visuali[sz]er)|lyrics?|4k|60fps|1080p|720p|hd|hq|(?:\d{2,3}\s*kbps\s*)?(?:mp3|flac|lossless)|\d{2,3}\s*kbps|cd\s*rip)\s*[)\]}]").unwrap()
 });
 
-static EXTRA_SPACES_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\s+").unwrap()
+static FEATURE_CREDIT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:\s*[(\[]\s*|\s+)(?:feat\.?|ft\.?|featuring)\s+([^\r\n)\]\[|(]+)[)\]]?")
+        .unwrap()
 });
 
-/// Cleans title and parses out artists.
-#[derive(Debug, Clone)]
+static ARTIST_SEPARATOR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\s*[,;·]\s*|\s+/\s+|\s+(?:&|and|x|with|feat\.?|ft\.?|featuring)\s+").unwrap()
+});
+
+static CHANNEL_SUFFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?:\s+-\s+topic|\s*vevo)$").unwrap());
+
+static VERSION_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:live|remix|mix|karaoke|instrumental|acoustic|cover|sped[ -]up|slowed|nightcore|demo|stripped|edit|extended|remaster(?:ed)?|session|alternate|version|reprise)\b").unwrap()
+});
+
+#[derive(Debug)]
 pub struct CleanedTrackMeta {
     pub cleaned_title: String,
-    pub formatted_artist: String,
     pub extracted_artists: Vec<String>,
-    pub was_title_cleaned: bool,
-    pub were_artists_reformatted: bool,
 }
 
 pub fn clean_track(raw_title: &str, raw_artist: &str) -> CleanedTrackMeta {
-    let mut title = raw_title.trim().to_string();
-    let mut initial_artist = raw_artist.trim().to_string();
-    let original_title = title.clone();
-    let original_artist = initial_artist.clone();
+    let title = strip_title_noise(raw_title);
+    let artist = clean_artist(raw_artist);
+    let mut artist = artist.as_str();
 
-    // 1. Check if artist is empty or generic, and title has "Artist - Song Title" format
-    let is_generic_artist = initial_artist.is_empty()
-        || initial_artist.eq_ignore_ascii_case("unknown")
-        || initial_artist.eq_ignore_ascii_case("unknown artist")
-        || initial_artist.eq_ignore_ascii_case("various artists")
-        || initial_artist.eq_ignore_ascii_case("youtube");
-
-    if (is_generic_artist || initial_artist.is_empty()) && title.contains(" - ") {
-        let parts: Vec<&str> = title.splitn(2, " - ").collect();
-        if parts.len() == 2 && !parts[0].trim().is_empty() && !parts[1].trim().is_empty() {
-            initial_artist = parts[0].trim().to_string();
-            title = parts[1].trim().to_string();
+    if let Some((prefix, suffix)) = title.split_once(" - ") {
+        if !prefix.trim().is_empty()
+            && !suffix.trim().is_empty()
+            && (prefix.trim().eq_ignore_ascii_case(artist)
+                || (is_unknown_artist(artist) && !VERSION_SUFFIX.is_match(suffix)))
+        {
+            let parsed_artist = clean_artist(prefix);
+            return finish_title(suffix, &parsed_artist);
         }
     }
 
-    // 2. Strip file format extensions (.mp3, .flac, .m4a, etc.) and format noise (320kbps, etc.)
-    title = FORMAT_EXTENSION_RE.replace(&title, "").to_string();
-    title = FORMAT_NOISE_RE.replace_all(&title, " ").to_string();
-    initial_artist = FORMAT_EXTENSION_RE.replace(&initial_artist, "").to_string();
-    initial_artist = FORMAT_NOISE_RE.replace_all(&initial_artist, " ").to_string();
-
-    // 3. Remove pipe suffixes like "Song Title | Official Audio"
-    title = PIPE_SUFFIX_RE.replace(&title, "").to_string();
-
-    // 3. Extract featured artists from title: "Starboy (feat. Daft Punk)"
-    let mut extra_artists = Vec::new();
-    if let Some(caps) = FEAT_RE.captures(&title) {
-        if let Some(m) = caps.get(1) {
-            let feat_str = m.as_str().trim();
-            for sub in split_artists(feat_str) {
-                if !sub.is_empty() {
-                    extra_artists.push(sub);
-                }
-            }
-        }
-        title = FEAT_RE.replace_all(&title, "").to_string();
+    if is_unknown_artist(artist) {
+        artist = "";
     }
+    finish_title(&title, artist)
+}
 
-    // 4. Strip bracketed video/audio/lyrics noise
-    title = BRACKET_NOISE_RE.replace_all(&title, "").to_string();
-    title = UNMATCHED_BRACKETS_RE.replace_all(&title, "").to_string();
+pub fn clean_catalog_title(raw_title: &str) -> String {
+    finish_title(&strip_title_noise(raw_title), "").cleaned_title
+}
 
-    // 5. Clean whitespace & quotation marks
-    title = EXTRA_SPACES_RE.replace_all(&title, " ").trim().to_string();
-    title = title.trim_matches(|c| c == '"' || c == '\'' || c == '`').trim().to_string();
+pub fn featured_artists(title: &str) -> Vec<String> {
+    FEATURE_CREDIT
+        .captures_iter(title.split('|').next().unwrap_or(title))
+        .flat_map(|credits| split_artists(&credits[1]))
+        .collect()
+}
 
-    // If title became empty after aggressive stripping, restore original without outer noise
-    if title.is_empty() {
-        title = raw_title.trim().to_string();
-    }
+fn strip_title_noise(raw: &str) -> String {
+    let title = FILE_EXTENSION.replace(raw.trim(), "");
+    VIDEO_NOISE
+        .replace_all(&title.replace(['–', '—'], "-"), "")
+        .into_owned()
+}
 
-    // 6. Gather all artists: initial artist + extra artists
-    let mut artist_list = split_artists(&initial_artist);
-    for extra in extra_artists {
-        let exists = artist_list.iter().any(|a| a.eq_ignore_ascii_case(&extra));
-        if !exists && !extra.is_empty() {
-            artist_list.push(extra);
+fn finish_title(title: &str, artist: &str) -> CleanedTrackMeta {
+    let mut artists = split_artists(artist);
+    let base = match title.split_once('|') {
+        Some((head, tail)) if !VERSION_SUFFIX.is_match(tail) => head,
+        _ => title,
+    };
+    for name in featured_artists(base) {
+        if !artists.iter().any(|a| a.eq_ignore_ascii_case(&name)) {
+            artists.push(name);
         }
     }
-
-    if artist_list.is_empty() {
-        artist_list.push("Unknown Artist".to_string());
-    }
-
-    // 7. Format canonical artist with " / " separator
-    let formatted_artist = artist_list.join(" / ");
-
-    let was_title_cleaned = title != original_title;
-    let were_artists_reformatted = formatted_artist != original_artist;
-
+    let cleaned_title = collapse_spaces(&FEATURE_CREDIT.replace_all(base, ""));
+    let cleaned_title = if cleaned_title.is_empty() {
+        title.trim().to_owned()
+    } else {
+        cleaned_title
+    };
     CleanedTrackMeta {
-        cleaned_title: title,
-        formatted_artist,
-        extracted_artists: artist_list,
-        was_title_cleaned,
-        were_artists_reformatted,
+        cleaned_title,
+        extracted_artists: artists,
     }
 }
 
-/// Splits a raw artist string by multiple possible separators: " / ", " & ", ", ", " feat. ", etc.
+fn clean_artist(raw: &str) -> String {
+    let name = FILE_EXTENSION.replace(raw.trim(), "");
+    let name = VIDEO_NOISE.replace_all(&name, "");
+    collapse_spaces(&CHANNEL_SUFFIX.replace(&name, ""))
+}
+
+fn collapse_spaces(raw: &str) -> String {
+    raw.trim_matches([' ', '"', '\''])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_unknown_artist(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "" | "unknown" | "unknown artist" | "unknown channel" | "various artists" | "youtube"
+    )
+}
+
 pub fn split_artists(raw: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    if raw.trim().is_empty() {
-        return result;
-    }
-
-    // Normalize potential separators to a unique token "###"
-    let mut s = raw.to_string();
-    let separators = [
-        " / ",
-        " & ",
-        " and ",
-        " feat. ",
-        " ft. ",
-        " featuring ",
-        " Feat. ",
-        " Ft. ",
-        ", ",
-        "; ",
-        " x ",
-        " X ",
-        " with ",
-        " With ",
-    ];
-
-    for sep in separators {
-        s = s.replace(sep, "###");
-    }
-
-    for item in s.split("###") {
-        let trimmed = item
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'' || c == '`')
-            .trim();
-        if !trimmed.is_empty() && !result.iter().any(|existing: &String| existing.eq_ignore_ascii_case(trimmed)) {
-            result.push(trimmed.to_string());
+    let mut artists = Vec::new();
+    for credit in ARTIST_SEPARATOR.split(raw) {
+        let name = collapse_spaces(credit);
+        if !is_unknown_artist(&name)
+            && !artists
+                .iter()
+                .any(|a: &String| a.eq_ignore_ascii_case(&name))
+        {
+            artists.push(name);
         }
     }
-
-    result
+    artists
 }
 
 #[cfg(test)]
@@ -173,43 +134,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_clean_youtube_title() {
+    fn clean_youtube_title() {
         let res = clean_track(
             "Starboy (Official Music Video) [4K] ft. Daft Punk",
             "The Weeknd",
         );
         assert_eq!(res.cleaned_title, "Starboy");
-        assert_eq!(res.formatted_artist, "The Weeknd / Daft Punk");
-        assert!(res.was_title_cleaned);
+        assert_eq!(res.extracted_artists, ["The Weeknd", "Daft Punk"]);
     }
 
     #[test]
-    fn test_artist_dash_title() {
+    fn artist_dash_title() {
         let res = clean_track(
             "Eminem feat. Rihanna - Love The Way You Lie (Audio)",
             "Unknown",
         );
         assert_eq!(res.cleaned_title, "Love The Way You Lie");
-        assert_eq!(res.formatted_artist, "Eminem / Rihanna");
+        assert_eq!(res.extracted_artists, ["Eminem", "Rihanna"]);
     }
 
     #[test]
-    fn test_clean_audio_bracket() {
-        let res = clean_track(
-            "Levitating [Clean Audio]",
-            "Dua Lipa & DaBaby",
-        );
+    fn clean_audio_bracket() {
+        let res = clean_track("Levitating [Clean Audio]", "Dua Lipa & DaBaby");
         assert_eq!(res.cleaned_title, "Levitating");
-        assert_eq!(res.formatted_artist, "Dua Lipa / DaBaby");
+        assert_eq!(res.extracted_artists, ["Dua Lipa", "DaBaby"]);
     }
 
     #[test]
-    fn test_strip_format_extension_and_mp3_noise() {
-        let res = clean_track(
-            "Blinding Lights [320kbps MP3].mp3",
-            "The Weeknd",
-        );
+    fn strip_format_extension_and_mp3_noise() {
+        let res = clean_track("Blinding Lights [320kbps MP3].mp3", "The Weeknd");
         assert_eq!(res.cleaned_title, "Blinding Lights");
-        assert_eq!(res.formatted_artist, "The Weeknd");
+        assert_eq!(res.extracted_artists, ["The Weeknd"]);
+    }
+
+    #[test]
+    fn keep_recording_versions_and_words_that_resemble_noise() {
+        let res = clean_track("Live Forever (Live at Knebworth) [HD]", "Oasis");
+        assert_eq!(res.cleaned_title, "Live Forever (Live at Knebworth)");
+        let res = clean_track("Flacquer (Audio, Video, Disco)", "AC/DC");
+        assert_eq!(res.cleaned_title, "Flacquer (Audio, Video, Disco)");
+        assert_eq!(res.extracted_artists, ["AC/DC"]);
     }
 }

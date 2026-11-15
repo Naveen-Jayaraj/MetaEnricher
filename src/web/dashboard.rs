@@ -587,10 +587,10 @@ const DASHBOARD_HTML: &str = r###"<!DOCTYPE html>
     <div id="tab-single" class="tab-content active">
       <div class="card">
         <div class="card-title">
-          <span>Extreme Deep Search &bull; Single Song Enricher</span>
+          <span>Song metadata search</span>
         </div>
         <div class="card-desc">
-          Sends unverified / messy track metadata, extracts artists formatted as <code>" / "</code>, cleans YouTube artifacts, queries Deezer + iTunes + MusicBrainz + LRCLIB, and validates all extended creative credits.
+          Add the album or duration to help distinguish recordings with the same title.
         </div>
 
         <div class="form-grid">
@@ -605,6 +605,10 @@ const DASHBOARD_HTML: &str = r###"<!DOCTYPE html>
           <div class="form-group">
             <label>Album (Optional)</label>
             <input type="text" id="input-album" value="" placeholder="Leave empty for auto-discovery">
+          </div>
+          <div class="form-group">
+            <label for="input-duration">Duration in seconds (optional)</label>
+            <input type="number" id="input-duration" min="0" step="any">
           </div>
           <div class="form-group">
             <label>Source</label>
@@ -845,6 +849,8 @@ if (enriched.success) {
 
     // Preset Buttons
     function presetSample(type) {
+      document.getElementById('input-album').value = '';
+      document.getElementById('input-duration').value = '';
       if (type === 'blinding') {
         document.getElementById('input-title').value = "Blinding Lights [Official Audio]";
         document.getElementById('input-artist').value = "The Weeknd";
@@ -852,8 +858,10 @@ if (enriched.success) {
         document.getElementById('input-title').value = "Love The Way You Lie (Music Video) feat. Rihanna";
         document.getElementById('input-artist').value = "Eminem";
       } else if (type === 'pava') {
-        document.getElementById('input-title').value = "podimmesha mulakkana kaalam";
+        document.getElementById('input-title').value = "Podimeesha Mulakkana Kaalam";
         document.getElementById('input-artist').value = "Pa Va, P Jayachandran, Santhosh Varma, Anand Madhusoodanan";
+        document.getElementById('input-album').value = "Pa Va";
+        document.getElementById('input-duration').value = "195";
       }
     }
 
@@ -895,12 +903,13 @@ if (enriched.success) {
       btn.disabled = true;
       btn.innerHTML = '<span class="loader"></span> Deep Searching...';
 
+      const duration = Math.round(document.getElementById('input-duration').valueAsNumber * 1000);
       const payload = {
         title: document.getElementById('input-title').value,
         artist: document.getElementById('input-artist').value,
         album: document.getElementById('input-album').value || null,
         source: document.getElementById('input-source').value,
-        durationMs: 230000
+        durationMs: Number.isSafeInteger(duration) && duration > 0 ? duration : 0
       };
 
       try {
@@ -931,7 +940,7 @@ if (enriched.success) {
       document.getElementById('preview-album').textContent = (s.album || 'Unknown Album') + ' \u2022 ' + (s.year || 'Unknown Year');
 
       document.getElementById('badge-metachecked').innerHTML = s.metachecked ? '&check; metachecked = true' : '&times; metachecked = false';
-      document.getElementById('badge-status').textContent = 'status: ' + s.metadataStatus;
+      document.getElementById('badge-status').textContent = a.matched ? 'Match found' : 'No confident match';
       document.getElementById('badge-lyrics').textContent = s.lyricsAvailable ? '\u2665 lyrics available' : 'No lyrics';
       document.getElementById('badge-mood').textContent = 'Mood: ' + (s.mood || 'N/A');
       document.getElementById('badge-lang').textContent = 'Lang: ' + (s.language || 'N/A');
@@ -960,17 +969,22 @@ if (enriched.success) {
 
       for (const [key, val] of fields) {
         const tr = document.createElement('tr');
-        let statusTag = '';
+        const keyCell = tr.insertCell();
+        keyCell.style.fontWeight = '600';
+        keyCell.style.fontFamily = 'var(--mono)';
+        keyCell.textContent = key;
+        tr.insertCell().textContent = val;
+        const status = tr.insertCell();
         if (a.fieldsCorrected && a.fieldsCorrected.includes(key)) {
-          statusTag = '<span class="tag-corrected">CORRECTED</span>';
+          status.className = 'tag-corrected';
+          status.textContent = 'CORRECTED';
         } else if (a.fieldsUpdated && a.fieldsUpdated.includes(key)) {
-          statusTag = '<span class="tag-updated">DISCOVERED</span>';
+          status.className = 'tag-updated';
+          status.textContent = 'DISCOVERED';
+        } else {
+          status.style.color = 'var(--text-dim)';
+          status.textContent = '—';
         }
-        tr.innerHTML = `
-          <td style="font-weight:600; font-family:var(--mono);">${key}</td>
-          <td>${val}</td>
-          <td>${statusTag || '<span style="color:var(--text-dim);">Verified</span>'}</td>
-        `;
         tbody.appendChild(tr);
       }
     }

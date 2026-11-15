@@ -1,123 +1,166 @@
-#![allow(dead_code)]
-
+use super::matching::{catalog_artists, year_from_date, Candidate, Recording, SearchQuery, Source};
 use reqwest::Client;
 use serde::Deserialize;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
-pub struct ITunesService {
+pub(super) struct ITunesService {
     client: Client,
+    requests: Mutex<VecDeque<Instant>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ITunesResponse {
-    results: Option<Vec<ITunesTrackItem>>,
+#[derive(Deserialize)]
+struct SearchResponse {
+    #[serde(default)]
+    results: Vec<Track>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ITunesTrackItem {
-    pub track_name: Option<String>,
-    pub artist_name: Option<String>,
-    pub collection_name: Option<String>,
-    pub primary_genre_name: Option<String>,
-    pub release_date: Option<String>,
-    pub track_number: Option<i32>,
-    pub track_time_millis: Option<i64>,
-    pub artwork_url100: Option<String>,
+struct Track {
+    track_id: Option<i64>,
+    track_name: Option<String>,
+    artist_name: Option<String>,
+    collection_name: Option<String>,
+    primary_genre_name: Option<String>,
+    release_date: Option<String>,
+    track_number: Option<i32>,
+    track_time_millis: Option<i64>,
+    artwork_url100: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ITunesEnrichedData {
-    pub track_name: Option<String>,
-    pub artist_name: Option<String>,
-    pub album_name: Option<String>,
-    pub primary_genre: Option<String>,
-    pub release_year: Option<i32>,
-    pub track_number: Option<i32>,
-    pub high_res_artwork: Option<String>,
-    pub duration_ms: Option<i64>,
+impl Track {
+    fn into_candidate(self, query: &SearchQuery) -> Option<Candidate> {
+        let title = self.track_name?;
+        let artist = self.artist_name?;
+        let artwork = self
+            .artwork_url100
+            .map(|url| url.replace("100x100bb.", "1200x1200bb."));
+        Some(Candidate::new(
+            Source::ITunes,
+            self.track_id?.to_string(),
+            Recording {
+                title,
+                artists: catalog_artists(&artist, query),
+                album: self.collection_name,
+                year: self.release_date.as_deref().and_then(year_from_date),
+                track_number: self.track_number,
+                duration_ms: self.track_time_millis,
+                genre: self.primary_genre_name,
+                artwork,
+                ..Recording::default()
+            },
+        ))
+    }
 }
 
 impl ITunesService {
-    pub fn new() -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .user_agent("MetaEnricher/1.0 (OfflineMusic)")
-            .build()
-            .unwrap_or_else(|_| Client::new());
-        Self { client }
+    pub fn new(client: Client) -> Self {
+        Self {
+            client,
+            requests: Mutex::new(VecDeque::new()),
+        }
     }
 
-    pub async fn search_track(
+    pub async fn search(&self, query: &SearchQuery, alternate: bool) -> Vec<Candidate> {
+        let country = preferred_storefront(query);
+        let (term, country) = if alternate {
+            (
+                query.alternate_term(),
+                if country == "US" { "IN" } else { "US" },
+            )
+        } else {
+            (query.term(), country)
+        };
+        self.search_storefront(query, &term, country)
+            .await
+            .unwrap_or_default()
+    }
+
+    async fn search_storefront(
         &self,
-        title: &str,
-        artist: &str,
-        album: Option<&str>,
-    ) -> Option<ITunesEnrichedData> {
-        // 1. Try title + artist
-        let mut term = format!("{} {}", title, artist);
-        let mut track = self.execute_query(&term).await;
-
-        // 2. Try title + album if album is known
-        if track.is_none() {
-            if let Some(alb) = album {
-                if !alb.trim().is_empty() {
-                    term = format!("{} {}", title, alb);
-                    track = self.execute_query(&term).await;
-                }
+        query: &SearchQuery,
+        term: &str,
+        country: &str,
+    ) -> Option<Vec<Candidate>> {
+        {
+            let mut requests = self.requests.lock().expect("iTunes request limiter");
+            let now = Instant::now();
+            while requests
+                .front()
+                .is_some_and(|start| now.duration_since(*start) >= Duration::from_secs(60))
+            {
+                requests.pop_front();
             }
+            // The Search API allows approximately 20 calls per minute. Other providers can
+            // still answer immediately when this storefront's request budget is exhausted.
+            if requests.len() >= 20 {
+                return None;
+            }
+            requests.push_back(now);
         }
-
-        // 3. Try primary title keyword (e.g. "Podimeesha" from "Podimeesha Mulakkana Kaalam")
-        if track.is_none() {
-            let first_word = title.split_whitespace().next().unwrap_or(title);
-            if let Some(alb) = album {
-                term = format!("{} {}", first_word, alb);
-                track = self.execute_query(&term).await;
-            }
-            if track.is_none() {
-                track = self.execute_query(first_word).await;
-            }
-        }
-
-        let item = track?;
-
-        let mut release_year = None;
-        if let Some(date_str) = &item.release_date {
-            if let Some(year_part) = date_str.split('-').next() {
-                if let Ok(yr) = year_part.parse::<i32>() {
-                    if yr > 1900 && yr < 2100 {
-                        release_year = Some(yr);
-                    }
-                }
-            }
-        }
-
-        let high_res_artwork = item.artwork_url100.map(|url| {
-            url.replace("100x100bb.jpg", "1200x1200bb.jpg")
-                .replace("100x100bb.png", "1200x1200bb.png")
-        });
-
-        Some(ITunesEnrichedData {
-            track_name: item.track_name,
-            artist_name: item.artist_name,
-            album_name: item.collection_name,
-            primary_genre: item.primary_genre_name,
-            release_year,
-            track_number: item.track_number,
-            high_res_artwork,
-            duration_ms: item.track_time_millis,
-        })
+        let response: SearchResponse = self
+            .client
+            .get("https://itunes.apple.com/search")
+            .query(&[
+                ("term", term),
+                ("country", country),
+                ("media", "music"),
+                ("entity", "song"),
+                ("limit", "16"),
+            ])
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        Some(
+            response
+                .results
+                .into_iter()
+                .filter_map(|item| item.into_candidate(query))
+                .collect(),
+        )
     }
+}
 
-    async fn execute_query(&self, term: &str) -> Option<ITunesTrackItem> {
-        let url = format!(
-            "https://itunes.apple.com/search?term={}&entity=song&limit=5",
-            urlencoding::encode(term)
-        );
-        let resp = self.client.get(&url).send().await.ok()?;
-        let itunes_res: ITunesResponse = resp.json().await.ok()?;
-        itunes_res.results?.into_iter().next()
+fn preferred_storefront(query: &SearchQuery) -> &'static str {
+    let names = std::iter::once(&query.title).chain(&query.artists);
+    for c in names.flat_map(|s| s.chars()) {
+        match c {
+            '\u{0900}'..='\u{0d7f}' => return "IN",
+            '\u{3040}'..='\u{30ff}' => return "JP",
+            '\u{ac00}'..='\u{d7af}' => return "KR",
+            _ => {}
+        }
+    }
+    "US"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::matching::rank_candidates;
+
+    #[test]
+    fn ranks_all_apple_results_and_uses_the_complete_credit() {
+        let response: SearchResponse = serde_json::from_str(r#"{"results":[
+            {"trackId":1,"trackName":"Happier","artistName":"Olivia Rodrigo","trackTimeMillis":175000},
+            {"trackId":2,"trackName":"Happier (Stripped)","artistName":"Marshmello & Bastille","trackTimeMillis":155000},
+            {"trackId":3,"trackName":"Happier","artistName":"Marshmello & Bastille","collectionName":"Happier - Single","releaseDate":"2018-08-16T12:00:00Z","trackNumber":1,"trackTimeMillis":214290}
+        ]}"#).unwrap();
+        let query = SearchQuery::new("happier", "marshmello", None, None, 214_000);
+        let options: Vec<_> = response
+            .results
+            .into_iter()
+            .filter_map(|r| r.into_candidate(&query))
+            .collect();
+        let selected = rank_candidates(&query, &options);
+        assert_eq!(selected[0].id, "3");
+        assert_eq!(selected[0].recording.artists, ["Marshmello", "Bastille"]);
     }
 }

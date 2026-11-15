@@ -1,595 +1,803 @@
-use crate::models::{EnrichmentAudit, LyricQuery, SingleSongResponse, TrackEntity};
-use crate::services::cleaner::{clean_track, split_artists};
+use crate::models::{EnrichmentAudit, SingleSongResponse, TrackEntity};
+use crate::services::cleaner::clean_catalog_title;
 use crate::services::deezer::DeezerService;
 use crate::services::itunes::ITunesService;
-use crate::services::lyrics::LyricsAggregator;
+use crate::services::lyrics::{LyricMatch, LyricsAggregator};
+use crate::services::matching::{
+    add_names, album_key, duration_delta, has_exact_title, normalize, rank_candidates, same_album,
+    same_recording, score, Candidate, Recording, SearchQuery, Source,
+};
 use crate::services::musicbrainz::MusicBrainzService;
 use crate::services::web_search::WebSearchService;
 use moka::future::Cache;
-use strsim::jaro_winkler;
+use moka::Expiry;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-#[derive(Clone)]
 pub struct MetadataEnricher {
     deezer: DeezerService,
     itunes: ITunesService,
     musicbrainz: MusicBrainzService,
     web_search: WebSearchService,
     lyrics: Arc<LyricsAggregator>,
-    cache: Cache<String, SingleSongResponse>,
+    cache: Cache<SearchQuery, Arc<Discovery>>,
+}
+
+#[derive(Default)]
+struct Discovery {
+    recording: Option<Recording>,
+    sources: Vec<&'static str>,
+    confidence: f32,
+    lyrics: Option<Arc<LyricMatch>>,
+}
+
+struct DiscoveryExpiry;
+
+impl Expiry<SearchQuery, Arc<Discovery>> for DiscoveryExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &SearchQuery,
+        value: &Arc<Discovery>,
+        _created_at: Instant,
+    ) -> Option<Duration> {
+        let seconds = if value.recording.is_none() {
+            30
+        } else if value.sources.len() < 2 {
+            300
+        } else {
+            86_400
+        };
+        Some(Duration::from_secs(seconds))
+    }
 }
 
 impl MetadataEnricher {
     pub fn new(lyrics: Arc<LyricsAggregator>) -> Self {
-        let cache = Cache::builder()
-            .max_capacity(10_000)
-            .time_to_live(Duration::from_secs(86400)) // 24 hours
-            .build();
-
+        let client = super::http_client();
         Self {
-            deezer: DeezerService::new(),
-            itunes: ITunesService::new(),
-            musicbrainz: MusicBrainzService::new(),
+            deezer: DeezerService::new(client.clone()),
+            itunes: ITunesService::new(client.clone()),
+            musicbrainz: MusicBrainzService::new(client),
             web_search: WebSearchService::new(),
             lyrics,
-            cache,
+            cache: Cache::builder()
+                .max_capacity(10_000)
+                .expire_after(DiscoveryExpiry)
+                .build(),
         }
     }
 
-    pub async fn enrich_song(&self, mut track: TrackEntity) -> SingleSongResponse {
-        // Cache key based on input title + artist
-        let cache_key = format!(
-            "{}:{}",
-            track.title.to_lowercase().trim(),
-            track.artist.to_lowercase().trim()
+    pub async fn enrich_song(&self, track: TrackEntity) -> SingleSongResponse {
+        let mut query = SearchQuery::new(
+            &track.title,
+            &track.artist,
+            track.album.as_deref(),
+            track.year,
+            track.duration_ms,
         );
+        query.set_youtube_id(track.youtube_id.as_deref());
 
-        if let Some(cached) = self.cache.get(&cache_key).await {
-            let mut res = cached;
-            res.song.id = track.id.clone();
-            res.song.file_uri = track.file_uri.clone();
-            res.song.source = track.source.clone();
-            res.song.format = track.format.clone();
-            res.song.size_bytes = track.size_bytes;
-            res.song.bitrate_kbps = track.bitrate_kbps;
-            res.song.sample_rate = track.sample_rate;
-            res.song.date_added = track.date_added;
-            res.song.date_modified = track.date_modified;
-            return res;
-        }
-
-        let mut fields_updated = Vec::new();
-        let mut fields_corrected = Vec::new();
-        let mut sources_consulted = Vec::new();
-
-        // 1. Clean Title and Format Artists Canonical
-        let cleaned = clean_track(&track.title, &track.artist);
-        let mut raw_title_cleaned = cleaned.was_title_cleaned;
-        let mut artists_reformatted = cleaned.were_artists_reformatted;
-
-        if raw_title_cleaned {
-            fields_corrected.push("title".to_string());
-            track.title = cleaned.cleaned_title.clone();
-        }
-
-        if artists_reformatted || !track.artist.contains(" / ") && cleaned.extracted_artists.len() > 1 {
-            fields_corrected.push("artist".to_string());
-            track.artist = cleaned.formatted_artist.clone();
-        }
-
-        // 2. Deep Web Search & Artist/Movie Disambiguation (handles movie names inside artist, swapped title/artist, complex credits)
-        let disambig = self.web_search.disambiguate(&track.title, &track.artist).await;
-
-        if disambig.was_intermixed_or_swapped || disambig.resolved_movie_album.is_some() || !disambig.resolved_singers.is_empty() {
-            sources_consulted.push("Google/WebSearch".to_string());
-        }
-
-        // If title and artist were intermixed or swapped, reverse them cleanly
-        if disambig.was_intermixed_or_swapped && crate::services::web_search::looks_like_song_title(&track.artist) && crate::services::web_search::looks_like_artist_name(&track.title) {
-            std::mem::swap(&mut track.title, &mut track.artist);
-            fields_corrected.push("title".to_string());
-            fields_corrected.push("artist".to_string());
-            raw_title_cleaned = true;
-            artists_reformatted = true;
-        }
-
-        // Handle movie name extracted from artist or title
-        if let Some(ref movie) = disambig.resolved_movie_album {
-            if track.album.as_deref().unwrap_or("").trim().is_empty() {
-                track.album = Some(movie.clone());
-                fields_updated.push("album".to_string());
-            }
-
-            // Strip movie from title if it was attached like "Song Name / Movie Name"
-            let lower_movie = movie.to_lowercase();
-            let mut parts = track.title.split(&['/', '|', '-'][..]).map(|s| s.trim()).collect::<Vec<_>>();
-            if parts.len() > 1 {
-                parts.retain(|p| !p.to_lowercase().contains(&lower_movie) && !lower_movie.contains(&p.to_lowercase()));
-                if !parts.is_empty() {
-                    let cleaned_title = parts.join(" ");
-                    if cleaned_title != track.title {
-                        track.title = cleaned_title;
-                    }
-                }
-            }
-        }
-
-        // If web search identified actual singer(s), use them as canonical artist and filter out movie/composer names
-        if !disambig.resolved_singers.is_empty() {
-            let canon_singers = disambig.resolved_singers.join(" / ");
-            if track.artist != canon_singers {
-                track.artist = canon_singers;
-                if !fields_corrected.contains(&"artist".to_string()) {
-                    fields_corrected.push("artist".to_string());
-                }
-                artists_reformatted = true;
-            }
-        } else if let Some(ref movie) = disambig.resolved_movie_album {
-            // Remove movie from artist tokens if it was accidentally placed inside
-            let mut remaining_artists = split_artists(&track.artist);
-            remaining_artists.retain(|a| !a.eq_ignore_ascii_case(movie) && !movie.to_lowercase().contains(&a.to_lowercase()));
-            if !remaining_artists.is_empty() {
-                let filtered = remaining_artists.join(" / ");
-                if filtered != track.artist {
-                    track.artist = filtered;
-                    if !fields_corrected.contains(&"artist".to_string()) {
-                        fields_corrected.push("artist".to_string());
-                    }
-                }
-            }
-        }
-
-        // Handle resolved composers and lyricists
-        let mut combined_composers = disambig.resolved_composers.clone();
-        for lyr in &disambig.resolved_lyricists {
-            if !combined_composers.contains(lyr) {
-                combined_composers.push(lyr.clone());
-            }
-        }
-        if !combined_composers.is_empty() {
-            let comp_str = combined_composers.join(" / ");
-            if track.composer.as_deref().unwrap_or("").trim().is_empty() {
-                track.composer = Some(comp_str);
-                fields_updated.push("composer".to_string());
-            }
-        }
-
-        // Handle resolved producers
-        if !disambig.resolved_producers.is_empty() {
-            let prod_str = disambig.resolved_producers.join(" / ");
-            if track.producer.as_deref().unwrap_or("").trim().is_empty() {
-                track.producer = Some(prod_str);
-                fields_updated.push("producer".to_string());
-            }
-        }
-
-        // Handle detected language
-        if let Some(ref lang) = disambig.detected_language {
-            if track.language.as_deref().unwrap_or("").trim().is_empty() {
-                track.language = Some(lang.clone());
-                fields_updated.push("language".to_string());
-            }
-        }
-
-        // Primary search artist (first credited artist for external queries)
-        let artist_tokens = split_artists(&track.artist);
-        let primary_artist = artist_tokens
-            .first()
-            .cloned()
-            .unwrap_or_else(|| track.artist.clone());
-
-        // 3. Query Deep External Services Concurrently
-        let deezer_fut = self.deezer.search_track(&track.title, &primary_artist);
-        let itunes_fut = self.itunes.search_track(&track.title, &primary_artist, track.album.as_deref());
-        let mb_fut = self.musicbrainz.search_recording(&track.title, &primary_artist);
-        let lyric_query = LyricQuery {
-            id: Some(track.id.clone()),
-            title: track.title.clone(),
-            artist: primary_artist.clone(),
-            album: track.album.clone(),
-            duration_ms: if track.duration_ms > 0 { Some(track.duration_ms) } else { None },
-        };
-        let lyric_fut = self.lyrics.get_lyrics(&lyric_query);
-
-        let (deezer_res, itunes_res, mb_res, lyric_res) =
-            tokio::join!(deezer_fut, itunes_fut, mb_fut, lyric_fut);
-
-        if deezer_res.is_some() {
-            sources_consulted.push("Deezer".to_string());
-        }
-        if itunes_res.is_some() {
-            sources_consulted.push("iTunes".to_string());
-        }
-        if mb_res.is_some() {
-            sources_consulted.push("MusicBrainz".to_string());
-        }
-        if lyric_res.lyrics_available {
-            sources_consulted.push(lyric_res.source.clone());
-        }
-
-        let mut confidence_sum: f32 = 0.0;
-        let mut confidence_count = 0;
-
-        // 3. Synthesize & Correct Title
-        if let Some(ref dz) = deezer_res {
-            if let Some(ref dz_title) = dz.canonical_title {
-                let score = jaro_winkler(&track.title.to_lowercase(), &dz_title.to_lowercase()) as f32;
-                confidence_sum += score;
-                confidence_count += 1;
-                if score > 0.85 && track.title != *dz_title {
-                    track.title = dz_title.clone();
-                    if !fields_corrected.contains(&"title".to_string()) {
-                        fields_corrected.push("title".to_string());
-                    }
-                }
-            }
-        }
-
-        // 4. Synthesize Artists (ensure all credited artists are present and formatted with " / ")
-        let mut final_artists = split_artists(&track.artist);
-        if let Some(ref dz) = deezer_res {
-            for c in &dz.contributors {
-                let norm = c.trim();
-                if !norm.is_empty() && !final_artists.iter().any(|a| a.eq_ignore_ascii_case(norm)) {
-                    final_artists.push(norm.to_string());
-                }
-            }
-        }
-        if let Some(ref mb) = mb_res {
-            for a in &mb.artists {
-                let norm = a.trim();
-                if !norm.is_empty() && !final_artists.iter().any(|existing| existing.eq_ignore_ascii_case(norm)) {
-                    final_artists.push(norm.to_string());
-                }
-            }
-        }
-        if !final_artists.is_empty() {
-            let canon_artist = final_artists.join(" / ");
-            if track.artist != canon_artist {
-                track.artist = canon_artist;
-                if !fields_corrected.contains(&"artist".to_string()) {
-                    fields_corrected.push("artist".to_string());
-                }
-            }
-        }
-
-        // 5. Synthesize Album
-        let canonical_album = itunes_res
-            .as_ref()
-            .and_then(|it| it.album_name.clone())
-            .or_else(|| deezer_res.as_ref().and_then(|dz| dz.album_title.clone()))
-            .or_else(|| mb_res.as_ref().and_then(|mb| mb.album_title.clone()));
-
-        if let Some(ref alb) = canonical_album {
-            if track.album.as_deref().unwrap_or("").trim().is_empty() {
-                track.album = Some(alb.clone());
-                fields_updated.push("album".to_string());
-            } else if let Some(existing) = &track.album {
-                let score = jaro_winkler(&existing.to_lowercase(), &alb.to_lowercase());
-                if score < 0.6 {
-                    track.album = Some(alb.clone());
-                    fields_corrected.push("album".to_string());
-                }
-            }
-        }
-
-        // 6. Synthesize Year
-        let canonical_year = itunes_res
-            .as_ref()
-            .and_then(|it| it.release_year)
-            .or_else(|| deezer_res.as_ref().and_then(|dz| dz.release_year))
-            .or_else(|| mb_res.as_ref().and_then(|mb| mb.release_year));
-
-        if let Some(yr) = canonical_year {
-            if track.year.is_none() || track.year == Some(0) {
-                track.year = Some(yr);
-                fields_updated.push("year".to_string());
-            } else if let Some(existing_yr) = track.year {
-                if (existing_yr - yr).abs() > 3 {
-                    track.year = Some(yr);
-                    fields_corrected.push("year".to_string());
-                }
-            }
-        }
-
-        // 7. Synthesize Genre
-        let canonical_genre = itunes_res
-            .as_ref()
-            .and_then(|it| it.primary_genre.clone())
-            .or_else(|| deezer_res.as_ref().and_then(|dz| dz.genre.clone()))
-            .or_else(|| {
-                mb_res.as_ref().and_then(|mb| {
-                    mb.tags
-                        .iter()
-                        .find(|t| !t.contains("seen") && !t.contains("favorite"))
-                        .map(|t| capitalize_words(t))
-                })
-            });
-
-        if let Some(ref g) = canonical_genre {
-            if track.genre.as_deref().unwrap_or("").trim().is_empty() {
-                track.genre = Some(g.clone());
-                fields_updated.push("genre".to_string());
-            }
-        }
-
-        // 8. Synthesize Track Number
-        let canonical_track_num = itunes_res
-            .as_ref()
-            .and_then(|it| it.track_number)
-            .or_else(|| deezer_res.as_ref().and_then(|dz| dz.track_number));
-
-        if let Some(tn) = canonical_track_num {
-            if track.track_number.is_none() || track.track_number == Some(0) {
-                track.track_number = Some(tn);
-                fields_updated.push("trackNumber".to_string());
-            }
-        }
-
-        // 9. Extended Creative Credits: Producer & Composer
-        let mut discovered_producers = Vec::new();
-        let mut discovered_composers = Vec::new();
-
-        if let Some(ref mb) = mb_res {
-            for p in &mb.producers {
-                if !discovered_producers.contains(p) {
-                    discovered_producers.push(p.clone());
-                }
-            }
-            for c in &mb.composers {
-                if !discovered_composers.contains(c) {
-                    discovered_composers.push(c.clone());
-                }
-            }
-        }
-
-        if !discovered_producers.is_empty() {
-            let prod_str = discovered_producers.join(" / ");
-            if track.producer.as_deref().unwrap_or("").trim().is_empty() {
-                track.producer = Some(prod_str);
-                fields_updated.push("producer".to_string());
-            }
-        }
-
-        if !discovered_composers.is_empty() {
-            let comp_str = discovered_composers.join(" / ");
-            if track.composer.as_deref().unwrap_or("").trim().is_empty() {
-                track.composer = Some(comp_str);
-                fields_updated.push("composer".to_string());
-            }
-        }
-
-        // 10. Vocal Language
-        let detected_language = mb_res
-            .as_ref()
-            .and_then(|mb| mb.language.clone())
-            .or_else(|| {
-                // Infer from lyric or script
-                if lyric_res.is_instrumental() {
-                    Some("Instrumental".to_string())
-                } else if let Some(ref text) = lyric_res.plain_lyrics {
-                    Some(detect_script_language(text))
-                } else {
-                    None
-                }
-            });
-
-        if let Some(ref lang) = detected_language {
-            if track.language.as_deref().unwrap_or("").trim().is_empty() {
-                track.language = Some(lang.clone());
-                fields_updated.push("language".to_string());
-            }
-        }
-
-        // 11. Vibe & Mood Classification
-        let mut all_tags = Vec::new();
-        if let Some(ref g) = track.genre {
-            all_tags.push(g.to_lowercase());
-        }
-        if let Some(ref mb) = mb_res {
-            for t in &mb.tags {
-                all_tags.push(t.clone());
-            }
-        }
-        let detected_mood = infer_mood(&all_tags, track.year);
-        if track.mood.as_deref().unwrap_or("").trim().is_empty() {
-            track.mood = Some(detected_mood.clone());
-            fields_updated.push("mood".to_string());
-        }
-
-        // 12. Ultra High Resolution Artwork
-        let best_artwork = itunes_res
-            .as_ref()
-            .and_then(|it| it.high_res_artwork.clone())
-            .or_else(|| deezer_res.as_ref().and_then(|dz| dz.artwork_url.clone()));
-
-        let mut artwork_enhanced = false;
-        if let Some(art) = best_artwork {
-            if track.artwork_uri.as_deref().unwrap_or("").trim().is_empty() {
-                track.artwork_uri = Some(art);
-                fields_updated.push("artworkUri".to_string());
-                artwork_enhanced = true;
-            } else if let Some(existing_art) = &track.artwork_uri {
-                // If existing is low res thumbnail or placeholder, replace with high-res
-                if existing_art.contains("100x100") || existing_art.contains("50x50") || existing_art.contains("default") {
-                    track.artwork_uri = Some(art);
-                    fields_corrected.push("artworkUri".to_string());
-                    artwork_enhanced = true;
-                }
-            }
-        }
-
-        // 13. Lyrics Status & URI
-        let lyrics_found = lyric_res.lyrics_available;
-        track.lyrics_available = lyrics_found;
-        if lyrics_found {
-            track.lyrics_uri = lyric_res.lyrics_uri.clone();
-            fields_updated.push("lyricsUri".to_string());
-        }
-
-        // 14. Verification & Server Status Tags
-        track.metachecked = true;
-        track.metadata_status = "CONFIRMED".to_string();
-
-        let confidence_score = if confidence_count > 0 {
-            (confidence_sum / confidence_count as f32).clamp(0.75, 1.0)
-        } else if !sources_consulted.is_empty() {
-            0.88
+        let discovery = if query.title.is_empty() {
+            Arc::new(Discovery::default())
         } else {
-            0.60
+            self.cache
+                .get_with_by_ref(&query.key(), async {
+                    Arc::new(self.discover(&query).await)
+                })
+                .await
         };
-
-        let audit = EnrichmentAudit {
-            matched: !sources_consulted.is_empty(),
-            confidence_score,
-            fields_updated,
-            fields_corrected,
-            sources_consulted,
-            raw_title_cleaned,
-            artists_reformatted,
-            artwork_enhanced,
-            lyrics_found,
-            detected_language,
-            detected_mood: Some(detected_mood),
-        };
-
-        let lyrics_sample = lyric_res.synced_lyrics.as_ref().and_then(|s| {
-            s.lines().take(3).collect::<Vec<&str>>().join("\n").into()
-        });
-
-        let response = SingleSongResponse {
-            success: true,
-            song: track,
-            audit,
-            lyrics_sample,
-        };
-
-        self.cache.insert(cache_key, response.clone()).await;
+        let response = apply_discovery(track, &discovery);
+        if let Some(lyrics) = &discovery.lyrics {
+            let song = &response.song;
+            let canonical = SearchQuery::new(
+                &song.title,
+                &song.artist,
+                song.album.as_deref(),
+                None,
+                song.duration_ms,
+            );
+            self.lyrics.remember(&canonical, Arc::clone(lyrics)).await;
+        }
         response
     }
 
-    pub fn get_cache(&self) -> &Cache<String, SingleSongResponse> {
-        &self.cache
-    }
-}
+    async fn discover(&self, input: &SearchQuery) -> Discovery {
+        let (musicbrainz, deezer, itunes, lrclib) = tokio::join!(
+            self.musicbrainz.search(input, false),
+            self.deezer.search(input, false),
+            self.itunes.search(input, false),
+            self.lyrics.find_lrclib(input),
+        );
+        let mut candidates: Vec<_> = musicbrainz
+            .into_iter()
+            .chain(deezer)
+            .chain(itunes)
+            .collect();
+        if let Some(hit) = &lrclib {
+            candidates.push(hit.candidate.clone());
+        }
+        let mut matched = rank_candidates(input, &candidates);
+        let mut netease = None;
+        let mut netease_searched = false;
+        let mut query = input.clone();
+        let mut known_video = false;
 
-trait LyricHelper {
-    fn is_instrumental(&self) -> bool;
-}
-
-impl LyricHelper for crate::models::LyricResponse {
-    fn is_instrumental(&self) -> bool {
-        self.plain_lyrics
-            .as_deref()
-            .map(|p| p.to_lowercase().contains("instrumental"))
-            .unwrap_or(false)
-    }
-}
-
-fn capitalize_words(s: &str) -> String {
-    s.split_whitespace()
-        .map(|w| {
-            let mut c = w.chars();
-            match c.next() {
-                None => String::new(),
-                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        // Deeper searches run only when the initial catalogs fail to identify the recording.
+        if !matched.iter().any(|c| {
+            matches!(
+                c.source,
+                Source::MusicBrainz | Source::Deezer | Source::ITunes
+            ) && has_exact_title(input, &c.recording)
+        }) {
+            netease_searched = !lrclib
+                .as_ref()
+                .is_some_and(|hit| hit.has_lyrics() || hit.instrumental);
+            let (mb, dz, apple, videos, net) = tokio::join!(
+                self.musicbrainz.search(input, true),
+                self.deezer.search(input, true),
+                self.itunes.search(input, true),
+                self.web_search.search(input),
+                async {
+                    if netease_searched {
+                        self.lyrics.find_netease(input).await
+                    } else {
+                        None
+                    }
+                },
+            );
+            candidates.extend(mb.into_iter().chain(dz).chain(apple).chain(videos));
+            netease = net;
+            if let Some(hit) = &netease {
+                candidates.push(hit.candidate.clone());
             }
-        })
-        .collect::<Vec<String>>()
-        .join(" ")
-}
+            matched = rank_candidates(input, &candidates);
 
-fn detect_script_language(text: &str) -> String {
-    let mut has_cjk = false;
-    let mut has_hangul = false;
-    let mut has_kana = false;
-    let mut has_cyrillic = false;
-    let mut has_arabic = false;
-    let mut has_devanagari = false;
+            if matched.is_empty() {
+                if let Some(swapped) = input.swapped() {
+                    let reversed = rank_candidates(&swapped, &candidates);
+                    if !reversed.is_empty() {
+                        matched = reversed;
+                        query = swapped;
+                    }
+                }
+            }
+            if let Some(video) = candidates.iter().find(|c| {
+                c.source == Source::YouTube
+                    && input.youtube_id.as_deref() == Some(c.id.as_str())
+                    && duration_delta(input.duration_ms, c.recording.duration_ms)
+                        .is_none_or(|d| d <= 10_000)
+            }) {
+                if !matched
+                    .iter()
+                    .any(|c| same_recording(&video.recording, &c.recording))
+                {
+                    // The client supplied the exact upload. Its structured music data also works
+                    // when the original title or artist is just an uploader's label.
+                    matched = vec![video.clone()];
+                    known_video = true;
+                }
+            }
+        }
 
-    for c in text.chars() {
-        match c as u32 {
-            0x4E00..=0x9FFF => has_cjk = true,
-            0xAC00..=0xD7AF => has_hangul = true,
-            0x3040..=0x30FF => has_kana = true,
-            0x0400..=0x04FF => has_cyrillic = true,
-            0x0600..=0x06FF => has_arabic = true,
-            0x0900..=0x097F => has_devanagari = true,
-            _ => {}
+        let Some(winner) = matched.first() else {
+            return Discovery::default();
+        };
+        let recording = winner.recording.clone();
+        let score = score(&query, &recording).unwrap_or_default();
+        let confidence = if known_video {
+            0.95
+        } else {
+            (score as f32 / 130.0 + (matched.len() - 1).min(3) as f32 * 0.055).min(0.99)
+        };
+
+        let mut best_lyrics = [lrclib, netease]
+            .into_iter()
+            .flatten()
+            .filter(|hit| same_recording(&recording, &hit.candidate.recording))
+            .max_by_key(|hit| (hit.synced.is_some(), hit.instrumental, hit.has_lyrics()));
+
+        let canonical = SearchQuery::new(
+            &recording.title,
+            &recording.artists.join(" / "),
+            recording.album.as_deref().or(query.album.as_deref()),
+            None,
+            query
+                .duration_ms
+                .or(recording.duration_ms)
+                .unwrap_or_default(),
+        );
+
+        let (_, extra_lyrics) = tokio::join!(self.enrich_details(&query, &mut matched), async {
+            if best_lyrics
+                .as_ref()
+                .is_some_and(|hit| hit.has_lyrics() || hit.instrumental)
+            {
+                return None;
+            }
+            let title_or_artist_changed = normalize(&canonical.title) != normalize(&input.title)
+                || normalize(canonical.artist()) != normalize(input.artist());
+            let (retry, net) = tokio::join!(
+                async {
+                    if title_or_artist_changed {
+                        self.lyrics.find_lrclib(&canonical).await
+                    } else {
+                        None
+                    }
+                },
+                async {
+                    if !netease_searched || title_or_artist_changed {
+                        self.lyrics.find_netease(&canonical).await
+                    } else {
+                        None
+                    }
+                },
+            );
+            [retry, net]
+                .into_iter()
+                .flatten()
+                .filter(|hit| same_recording(&recording, &hit.candidate.recording))
+                .max_by_key(|hit| (hit.synced.is_some(), hit.instrumental, hit.has_lyrics()))
+        },);
+        if let Some(hit) = extra_lyrics {
+            if !matched.iter().any(|c| c.source == hit.candidate.source) {
+                matched.push(hit.candidate.clone());
+            }
+            best_lyrics = Some(hit);
+        }
+        let recording = merge_recordings(&query, &matched);
+        Discovery {
+            recording: Some(recording),
+            sources: matched.iter().map(|c| c.source.name()).collect(),
+            confidence,
+            lyrics: best_lyrics.map(Arc::new),
         }
     }
 
-    if has_hangul {
-        "Korean".to_string()
-    } else if has_kana {
-        "Japanese".to_string()
-    } else if has_cjk {
-        "Chinese".to_string()
-    } else if has_cyrillic {
-        "Russian".to_string()
-    } else if has_arabic {
-        "Arabic".to_string()
-    } else if has_devanagari {
-        "Hindi".to_string()
-    } else {
-        "English".to_string()
+    async fn enrich_details(&self, query: &SearchQuery, matches: &mut [Candidate]) {
+        let have_genre = matches.iter().any(|c| usable(c.recording.genre.as_deref()));
+        let preferred_album = select_release(query, matches).and_then(|r| r.album.as_deref());
+        let have_art = matches.iter().any(|c| {
+            same_album(preferred_album, c.recording.album.as_deref())
+                && usable(c.recording.artwork.as_deref())
+        });
+        futures::future::join_all(matches.iter_mut().map(|m| async move {
+            match m.source {
+                Source::MusicBrainz => self.musicbrainz.add_details(m, !have_art).await,
+                Source::Deezer => self.deezer.add_details(m, !have_genre).await,
+                _ => {}
+            }
+        }))
+        .await;
+    }
+
+    pub fn cache_size(&self) -> u64 {
+        self.cache.entry_count()
     }
 }
 
-fn infer_mood(tags: &[String], _year: Option<i32>) -> String {
-    let joined = tags.join(" ");
-
-    if joined.contains("ambient")
-        || joined.contains("acoustic")
-        || joined.contains("lo-fi")
-        || joined.contains("chill")
-        || joined.contains("relax")
-        || joined.contains("downtempo")
-        || joined.contains("soul")
-        || joined.contains("r&b")
-    {
-        "Chill".to_string()
-    } else if joined.contains("dance")
-        || joined.contains("electronic")
-        || joined.contains("edm")
-        || joined.contains("house")
-        || joined.contains("upbeat")
-        || joined.contains("energetic")
-        || joined.contains("pop")
-        || joined.contains("hip-hop")
-        || joined.contains("rap")
-    {
-        "Energetic".to_string()
-    } else if joined.contains("metal")
-        || joined.contains("goth")
-        || joined.contains("industrial")
-        || joined.contains("dark")
-        || joined.contains("trap")
-        || joined.contains("drill")
-    {
-        "Dark".to_string()
-    } else if joined.contains("classical")
-        || joined.contains("piano")
-        || joined.contains("focus")
-        || joined.contains("instrumental")
-        || joined.contains("soundtrack")
-    {
-        "Focus".to_string()
-    } else if joined.contains("sad")
-        || joined.contains("blues")
-        || joined.contains("melanchol")
-        || joined.contains("slow")
-        || joined.contains("ballad")
-    {
-        "Melancholic".to_string()
-    } else if joined.contains("funk")
-        || joined.contains("disco")
-        || joined.contains("summer")
-        || joined.contains("uplifting")
-    {
-        "Uplifting".to_string()
+fn select_release<'a>(query: &SearchQuery, matches: &'a [Candidate]) -> Option<&'a Recording> {
+    let releases = matches.iter().map(|c| &c.recording).filter(|r| {
+        r.album
+            .as_ref()
+            .is_some_and(|album| !album_key(album).is_empty())
+    });
+    if query.album.is_some() {
+        releases
+            .filter(|r| same_album(query.album.as_deref(), r.album.as_deref()))
+            .min_by_key(|r| {
+                (
+                    query.year.is_some_and(|year| Some(year) != r.year),
+                    r.year.unwrap_or(i32::MAX),
+                )
+            })
     } else {
-        "Chill".to_string()
+        releases.min_by_key(|r| r.year.unwrap_or(i32::MAX))
+    }
+}
+
+fn merge_recordings(query: &SearchQuery, matches: &[Candidate]) -> Recording {
+    let best = &matches[0].recording;
+    let mut merged = Recording {
+        title: clean_catalog_title(&best.title),
+        duration_ms: matches
+            .iter()
+            .find_map(|c| c.recording.duration_ms.filter(|d| *d > 0)),
+        ..Recording::default()
+    };
+
+    // Start with individually credited names, then supplement partial credits from the
+    // same recording. An unstructured catalog can represent a band as a list of names.
+    let credit_sources = matches
+        .iter()
+        .filter(|m| m.source.has_structured_credits())
+        .chain(
+            matches
+                .iter()
+                .filter(|m| !m.source.has_structured_credits()),
+        );
+    let mut role_credits = Vec::new();
+    for source in matches
+        .iter()
+        .filter(|source| source.source.has_structured_credits())
+    {
+        add_names(&mut role_credits, &source.recording.composers);
+        add_names(&mut role_credits, &source.recording.producers);
+    }
+    for candidate in credit_sources {
+        let credits = &candidate.recording.artists;
+        let existing_credit = normalize(&merged.artists.join(" "));
+        let new_credit = normalize(&credits.join(" "));
+        if existing_credit != new_credit {
+            let names: Vec<_> = credits
+                .iter()
+                .filter(|name| {
+                    candidate.source.has_structured_credits()
+                        || !role_credits
+                            .iter()
+                            .any(|credit| normalize(credit) == normalize(name))
+                })
+                .cloned()
+                .collect();
+            add_names(&mut merged.artists, &names);
+        }
+    }
+
+    if let Some(release) = select_release(query, matches) {
+        merged.album = release.album.clone();
+        let same_edition = |c: &&Candidate| {
+            same_album(merged.album.as_deref(), c.recording.album.as_deref())
+                && !release
+                    .year
+                    .zip(c.recording.year)
+                    .is_some_and(|(a, b)| a.abs_diff(b) > 1)
+        };
+        merged.year = release.year;
+        merged.track_number = release.track_number.filter(|n| *n > 0).or_else(|| {
+            matches
+                .iter()
+                .filter(same_edition)
+                .find_map(|c| c.recording.track_number.filter(|n| *n > 0))
+        });
+        merged.artwork = matches.iter().filter(same_edition).find_map(|c| {
+            c.recording
+                .artwork
+                .as_ref()
+                .filter(|a| usable(Some(a)))
+                .cloned()
+        });
+    } else if query.album.is_none() {
+        merged.year = matches.iter().filter_map(|c| c.recording.year).min();
+    }
+
+    merged.genre = matches
+        .iter()
+        .filter(|c| usable(c.recording.genre.as_deref()))
+        .min_by_key(|c| {
+            let on_release = same_album(merged.album.as_deref(), c.recording.album.as_deref());
+            (
+                !on_release,
+                !matches!(c.source, Source::ITunes | Source::Deezer),
+            )
+        })
+        .and_then(|c| c.recording.genre.clone());
+    merged.language = matches.iter().find_map(|c| c.recording.language.clone());
+    for candidate in matches {
+        add_names(&mut merged.composers, &candidate.recording.composers);
+        add_names(&mut merged.producers, &candidate.recording.producers);
+        add_names(&mut merged.tags, &candidate.recording.tags);
+    }
+    merged
+}
+
+fn apply_discovery(mut track: TrackEntity, discovery: &Discovery) -> SingleSongResponse {
+    let original = track.clone();
+    let mut detected_language = None;
+    let mut detected_mood = None;
+    if let Some(recording) = &discovery.recording {
+        track.title.clone_from(&recording.title);
+        if !recording.artists.is_empty() {
+            track.artist = recording.artists.join(" / ");
+        }
+        replace(&mut track.album, &recording.album);
+        if track.year.is_none_or(|y| !(1000..=2100).contains(&y)) {
+            replace(&mut track.year, &recording.year);
+        }
+        if track.track_number.is_none_or(|n| n <= 0) {
+            replace(&mut track.track_number, &recording.track_number);
+        }
+        if track.duration_ms <= 0 {
+            track.duration_ms = recording.duration_ms.unwrap_or(track.duration_ms);
+        }
+        fill(&mut track.genre, recording.genre.clone());
+        fill(&mut track.composer, joined_names(&recording.composers));
+        fill(&mut track.producer, joined_names(&recording.producers));
+        detected_language = recording.language.clone().or_else(|| {
+            let lyrics = discovery.lyrics.as_ref()?;
+            if lyrics.instrumental {
+                Some("Instrumental".to_string())
+            } else {
+                lyrics
+                    .plain
+                    .as_deref()
+                    .or(lyrics.synced.as_deref())
+                    .and_then(detect_script_language)
+                    .map(str::to_owned)
+            }
+        });
+        fill(&mut track.language, detected_language.clone());
+        detected_mood = infer_mood(track.genre.as_deref(), &recording.tags).map(str::to_owned);
+        fill(&mut track.mood, detected_mood.clone());
+
+        let placeholder_artwork = track.artwork_uri.as_deref().is_some_and(|a| {
+            a.contains("100x100") || a.contains("50x50") || a.contains("i.ytimg.com/")
+        });
+        if !usable(track.artwork_uri.as_deref()) || placeholder_artwork {
+            replace(&mut track.artwork_uri, &recording.artwork);
+        }
+        track.metachecked = true;
+        if track.metadata_status != "MANUAL" {
+            track.metadata_status = "CONFIRMED".to_string();
+        }
+    }
+
+    let lyrics = discovery.lyrics.as_ref().filter(|hit| hit.has_lyrics());
+    if let Some(lyrics) = lyrics {
+        track.lyrics_available = true;
+        if !usable(track.lyrics_uri.as_deref())
+            || track
+                .lyrics_uri
+                .as_deref()
+                .is_some_and(|uri| uri.starts_with("/lyric/"))
+        {
+            track.lyrics_uri = lyrics.uri();
+        }
+    }
+    let title_cleaned = original.title != track.title;
+    let artist_reformatted = original.artist != track.artist;
+    let artwork_enhanced = original.artwork_uri != track.artwork_uri;
+    let mut audit = EnrichmentAudit {
+        matched: discovery.recording.is_some(),
+        confidence_score: discovery.confidence,
+        fields_updated: Vec::new(),
+        fields_corrected: Vec::new(),
+        sources_consulted: discovery
+            .sources
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        raw_title_cleaned: title_cleaned,
+        artists_reformatted: artist_reformatted,
+        artwork_enhanced,
+        lyrics_found: lyrics.is_some(),
+        detected_language,
+        detected_mood,
+    };
+    for (field, changed, existed) in [
+        ("title", title_cleaned, !original.title.trim().is_empty()),
+        (
+            "artist",
+            artist_reformatted,
+            !original.artist.trim().is_empty() && original.artist != "Unknown Artist",
+        ),
+        (
+            "album",
+            track.album != original.album,
+            original
+                .album
+                .as_deref()
+                .is_some_and(|a| !album_key(a).is_empty()),
+        ),
+        (
+            "year",
+            track.year != original.year,
+            original.year.is_some_and(|y| y > 0),
+        ),
+        (
+            "trackNumber",
+            track.track_number != original.track_number,
+            original.track_number.is_some_and(|n| n > 0),
+        ),
+        (
+            "durationMs",
+            track.duration_ms != original.duration_ms,
+            original.duration_ms > 0,
+        ),
+        (
+            "genre",
+            track.genre != original.genre,
+            usable(original.genre.as_deref()),
+        ),
+        (
+            "composer",
+            track.composer != original.composer,
+            usable(original.composer.as_deref()),
+        ),
+        (
+            "producer",
+            track.producer != original.producer,
+            usable(original.producer.as_deref()),
+        ),
+        (
+            "language",
+            track.language != original.language,
+            usable(original.language.as_deref()),
+        ),
+        (
+            "mood",
+            track.mood != original.mood,
+            usable(original.mood.as_deref()),
+        ),
+        (
+            "artworkUri",
+            artwork_enhanced,
+            usable(original.artwork_uri.as_deref()),
+        ),
+        (
+            "lyricsUri",
+            track.lyrics_uri != original.lyrics_uri,
+            usable(original.lyrics_uri.as_deref()),
+        ),
+    ] {
+        if changed {
+            let fields = if existed {
+                &mut audit.fields_corrected
+            } else {
+                &mut audit.fields_updated
+            };
+            fields.push(field.to_string());
+        }
+    }
+    let lyrics_sample = lyrics
+        .and_then(|hit| hit.synced.as_ref())
+        .map(|text| text.lines().take(3).collect::<Vec<_>>().join("\n"));
+    SingleSongResponse {
+        success: true,
+        song: track,
+        audit,
+        lyrics_sample,
+    }
+}
+
+fn usable(value: Option<&str>) -> bool {
+    value.is_some_and(|s| !s.trim().is_empty() && !s.trim().eq_ignore_ascii_case("unknown"))
+}
+
+fn replace<T: Clone>(field: &mut Option<T>, value: &Option<T>) {
+    if value.is_some() {
+        field.clone_from(value);
+    }
+}
+
+fn fill(field: &mut Option<String>, value: Option<String>) {
+    if !usable(field.as_deref()) && usable(value.as_deref()) {
+        *field = value;
+    }
+}
+
+fn joined_names(names: &[String]) -> Option<String> {
+    (!names.is_empty()).then(|| names.join(" / "))
+}
+
+fn detect_script_language(text: &str) -> Option<&'static str> {
+    let mut languages = text.chars().filter_map(|c| match c {
+        '\u{0a00}'..='\u{0a7f}' => Some("Punjabi"),
+        '\u{0b80}'..='\u{0bff}' => Some("Tamil"),
+        '\u{0c00}'..='\u{0c7f}' => Some("Telugu"),
+        '\u{0c80}'..='\u{0cff}' => Some("Kannada"),
+        '\u{0d00}'..='\u{0d7f}' => Some("Malayalam"),
+        '\u{3040}'..='\u{30ff}' => Some("Japanese"),
+        '\u{ac00}'..='\u{d7af}' => Some("Korean"),
+        _ => None,
+    });
+    let first = languages.next()?;
+    languages.all(|language| language == first).then_some(first)
+}
+
+fn infer_mood(genre: Option<&str>, tags: &[String]) -> Option<&'static str> {
+    let evidence = genre
+        .into_iter()
+        .chain(tags.iter().map(String::as_str))
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    [
+        (
+            "Chill",
+            &[
+                "ambient",
+                "acoustic",
+                "lo-fi",
+                "chill",
+                "relax",
+                "downtempo",
+                "soul",
+                "r&b",
+            ][..],
+        ),
+        (
+            "Dark",
+            &["metal", "goth", "industrial", "dark", "trap", "drill"][..],
+        ),
+        (
+            "Melancholic",
+            &["sad", "blues", "melancholic", "ballad"][..],
+        ),
+        ("Uplifting", &["funk", "disco", "uplifting"][..]),
+        (
+            "Energetic",
+            &[
+                "dance",
+                "electronic",
+                "edm",
+                "house",
+                "upbeat",
+                "energetic",
+                "pop",
+                "hip-hop",
+                "rap",
+            ][..],
+        ),
+        (
+            "Focus",
+            &["classical", "piano", "focus", "instrumental", "soundtrack"][..],
+        ),
+    ]
+    .into_iter()
+    .find_map(|(mood, hints)| {
+        evidence
+            .iter()
+            .any(|tag| hints.iter().any(|hint| tag.contains(hint)))
+            .then_some(mood)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn candidate(
+        source: Source,
+        title: &str,
+        artists: &[&str],
+        album: &str,
+        year: i32,
+        ms: i64,
+    ) -> Candidate {
+        Candidate::new(
+            source,
+            "1",
+            Recording {
+                title: title.into(),
+                artists: artists.iter().map(|a| (*a).into()).collect(),
+                album: Some(album.into()),
+                year: Some(year),
+                duration_ms: Some(ms),
+                ..Recording::default()
+            },
+        )
+    }
+
+    #[test]
+    fn merges_all_matching_happier_credits_and_keeps_the_selected_release() {
+        let query = SearchQuery::new("happier", "marshmello", None, None, 214_000);
+        let mut compilation = candidate(
+            Source::Deezer,
+            "Happier",
+            &["Marshmello"],
+            "Dance Party",
+            2024,
+            214_000,
+        );
+        compilation.recording.track_number = Some(9);
+        compilation.recording.artwork = Some("https://example.test/compilation.jpg".into());
+        let mut original = candidate(
+            Source::ITunes,
+            "Happier",
+            &["Marshmello", "Bastille"],
+            "Happier - Single",
+            2018,
+            214_290,
+        );
+        original.recording.track_number = Some(1);
+        let ranked = rank_candidates(
+            &query,
+            &[
+                compilation,
+                candidate(
+                    Source::ITunes,
+                    "Happier",
+                    &["Olivia Rodrigo"],
+                    "SOUR",
+                    2021,
+                    175_000,
+                ),
+                candidate(
+                    Source::Deezer,
+                    "Happier (Remix)",
+                    &["Marshmello", "Bastille", "Remixer"],
+                    "Remixes",
+                    2018,
+                    214_000,
+                ),
+                original,
+            ],
+        );
+        let metadata = merge_recordings(&query, &ranked);
+        assert_eq!(metadata.artists, ["Marshmello", "Bastille"]);
+        assert_eq!(metadata.album.as_deref(), Some("Happier - Single"));
+        assert_eq!(metadata.year, Some(2018));
+        assert_eq!(metadata.track_number, Some(1));
+        assert!(metadata.artwork.is_none());
+    }
+
+    #[test]
+    fn combines_a_verified_soundtrack_upload_with_its_catalog_release() {
+        let query = SearchQuery::new(
+            "Podimeesha Mulakkana Kaalam",
+            "Pa Va, P Jayachandran, Santhosh Varma, Anand Madhusoodanan",
+            Some("Pa Va"),
+            None,
+            195_000,
+        );
+        let mut upload = candidate(
+            Source::YouTube,
+            "Podimeesha Mulakkana Kaalam",
+            &["P. Jayachandran"],
+            "Pa Va",
+            2016,
+            191_000,
+        );
+        upload.recording.year = None;
+        upload.recording.composers = vec!["Santhosh Varma".into(), "Anand Madhusoodanan".into()];
+        let mut release = candidate(
+            Source::ITunes,
+            "Podimeesha",
+            &["P.Jayachandran", "Santhosh Varma"],
+            "Pa Va (Original Motion Picture Soundtrack) - EP",
+            2016,
+            194_961,
+        );
+        release.recording.track_number = Some(1);
+        let ranked = rank_candidates(&query, &[upload, release]);
+        let result = merge_recordings(&query, &ranked);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(result.artists, ["P. Jayachandran"]);
+        assert_eq!(result.composers, ["Santhosh Varma", "Anand Madhusoodanan"]);
+        assert_eq!(result.year, Some(2016));
+        assert_eq!(result.track_number, Some(1));
+    }
+
+    #[test]
+    fn cacheable_discovery_keeps_each_files_metadata_and_unknowns() {
+        let track: TrackEntity = serde_json::from_value(json!({
+            "id": "local-2", "title": "distant skies (live)", "artist": "Unlisted Artist", "durationMs": 191_000,
+            "genre": "Jazz", "fileUri": "file:///local-2.mp3", "lyricsAvailable": true, "lyricsUri": "file:///local-2.lrc"
+        })).unwrap();
+        let unmatched = apply_discovery(track.clone(), &Discovery::default());
+        assert!(!unmatched.audit.matched);
+        assert!(!unmatched.song.metachecked);
+        assert_eq!(unmatched.song.metadata_status, "PARSED");
+        assert!(unmatched.song.mood.is_none());
+        assert!(unmatched.song.lyrics_available);
+
+        let result = apply_discovery(
+            track,
+            &Discovery {
+                recording: Some(Recording {
+                    title: "Distant Skies (Live)".into(),
+                    genre: Some("Pop".into()),
+                    ..Recording::default()
+                }),
+                ..Discovery::default()
+            },
+        );
+        assert_eq!(result.song.id, "local-2");
+        assert_eq!(result.song.genre.as_deref(), Some("Jazz"));
+        assert_eq!(result.song.file_uri.as_deref(), Some("file:///local-2.mp3"));
+        assert_eq!(
+            result.song.lyrics_uri.as_deref(),
+            Some("file:///local-2.lrc")
+        );
+        assert_eq!(result.song.duration_ms, 191_000);
     }
 }

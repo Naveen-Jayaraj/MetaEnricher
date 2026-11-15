@@ -20,8 +20,8 @@ pub async fn health_handler(State(state): State<AppState>) -> Json<HealthStatus>
     let uptime = state.start_time.elapsed().as_secs();
     let song_requests = state.total_song_requests.load(Ordering::Relaxed);
     let lyric_requests = state.total_lyric_requests.load(Ordering::Relaxed);
-    let meta_cache = state.enricher.get_cache().entry_count();
-    let lyric_cache = state.lyrics.get_cache().entry_count();
+    let meta_cache = state.enricher.cache_size();
+    let lyric_cache = state.lyrics.cache_size();
 
     Json(HealthStatus {
         status: "ok".to_string(),

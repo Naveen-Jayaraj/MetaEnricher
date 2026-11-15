@@ -1,189 +1,191 @@
-#![allow(dead_code)]
-
+use super::matching::{add_names, year_from_date, Candidate, Recording, SearchQuery, Source};
 use reqwest::Client;
 use serde::Deserialize;
-use std::time::Duration;
 
-#[derive(Debug, Clone)]
-pub struct DeezerService {
+pub(super) struct DeezerService {
     client: Client,
 }
 
-#[derive(Debug, Deserialize)]
-struct DeezerSearchResponse {
-    data: Option<Vec<DeezerTrackItem>>,
+#[derive(Deserialize)]
+struct SearchResponse {
+    #[serde(default)]
+    data: Vec<Track>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DeezerTrackItem {
-    pub id: i64,
-    pub title: String,
-    pub duration: Option<i64>,
-    pub track_position: Option<i32>,
-    pub artist: Option<DeezerArtistItem>,
-    pub album: Option<DeezerAlbumItem>,
-    pub contributors: Option<Vec<DeezerContributor>>,
+#[derive(Deserialize)]
+struct Track {
+    id: i64,
+    title: String,
+    duration: Option<i64>,
+    track_position: Option<i32>,
+    artist: Option<Artist>,
+    album: Option<Album>,
+    contributors: Option<Vec<Contributor>>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DeezerArtistItem {
-    pub id: i64,
-    pub name: String,
+#[derive(Deserialize)]
+struct Artist {
+    name: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DeezerAlbumItem {
-    pub id: i64,
-    pub title: String,
-    pub cover_xl: Option<String>,
-    pub cover_big: Option<String>,
-    pub cover_medium: Option<String>,
+#[derive(Deserialize)]
+struct Album {
+    id: i64,
+    title: String,
+    cover_xl: Option<String>,
+    cover_big: Option<String>,
+    cover_medium: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DeezerContributor {
-    pub name: String,
-    pub role: Option<String>,
+#[derive(Deserialize)]
+struct Contributor {
+    name: String,
+    role: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DeezerTrackDetails {
-    pub release_date: Option<String>,
-    pub bpm: Option<f32>,
-    pub contributors: Option<Vec<DeezerContributor>>,
+#[derive(Deserialize)]
+struct TrackDetails {
+    release_date: Option<String>,
+    track_position: Option<i32>,
+    contributors: Option<Vec<Contributor>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DeezerAlbumDetails {
-    pub genres: Option<DeezerGenres>,
+#[derive(Deserialize)]
+struct AlbumDetails {
+    genres: Option<Genres>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DeezerGenres {
-    pub data: Option<Vec<DeezerGenreItem>>,
+#[derive(Deserialize)]
+struct Genres {
+    data: Vec<Genre>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DeezerGenreItem {
-    pub name: String,
+#[derive(Deserialize)]
+struct Genre {
+    name: String,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct DeezerEnrichedData {
-    pub canonical_title: Option<String>,
-    pub artist_name: Option<String>,
-    pub album_title: Option<String>,
-    pub release_year: Option<i32>,
-    pub track_number: Option<i32>,
-    pub genre: Option<String>,
-    pub artwork_url: Option<String>,
-    pub contributors: Vec<String>,
-    pub duration_ms: Option<i64>,
+fn add_contributors(artists: &mut Vec<String>, contributors: Option<Vec<Contributor>>) {
+    let performers: Vec<_> = contributors
+        .into_iter()
+        .flatten()
+        .filter(|c| {
+            matches!(
+                c.role.as_deref(),
+                None | Some("Main" | "Featured" | "Artist")
+            )
+        })
+        .map(|c| c.name)
+        .collect();
+    add_names(artists, &performers);
+}
+
+impl Track {
+    fn into_candidate(self) -> Candidate {
+        let mut artists: Vec<_> = self.artist.into_iter().map(|a| a.name).collect();
+        add_contributors(&mut artists, self.contributors);
+        let mut candidate = Candidate::new(
+            Source::Deezer,
+            self.id.to_string(),
+            Recording {
+                title: self.title,
+                artists,
+                duration_ms: self.duration.and_then(|d| d.checked_mul(1000)),
+                track_number: self.track_position,
+                ..Recording::default()
+            },
+        );
+        if let Some(album) = self.album {
+            candidate.release_id = Some(album.id.to_string());
+            candidate.recording.album = Some(album.title);
+            candidate.recording.artwork = album.cover_xl.or(album.cover_big).or(album.cover_medium);
+        }
+        candidate
+    }
 }
 
 impl DeezerService {
-    pub fn new() -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .user_agent("MetaEnricher/1.0 (OfflineMusic)")
-            .build()
-            .unwrap_or_else(|_| Client::new());
+    pub fn new(client: Client) -> Self {
         Self { client }
     }
 
-    pub async fn search_track(&self, title: &str, artist: &str) -> Option<DeezerEnrichedData> {
-        // First try specific track + artist query
-        let query = format!(r#"track:"{}" artist:"{}""#, title, artist);
-        let mut results = self.execute_search(&query).await;
-
-        // If not found, try simple fuzzy combined search
-        if results.is_none() {
-            let fallback_query = format!("{} {}", title, artist);
-            results = self.execute_search(&fallback_query).await;
-        }
-
-        let track = results?.into_iter().next()?;
-        let track_id = track.id;
-        let album_id = track.album.as_ref().map(|a| a.id);
-
-        let mut data = DeezerEnrichedData {
-            canonical_title: Some(track.title),
-            artist_name: track.artist.as_ref().map(|a| a.name.clone()),
-            album_title: track.album.as_ref().map(|a| a.title.clone()),
-            track_number: track.track_position,
-            duration_ms: track.duration.map(|d| d * 1000),
-            artwork_url: track.album.as_ref().and_then(|a| {
-                a.cover_xl
-                    .clone()
-                    .or_else(|| a.cover_big.clone())
-                    .or_else(|| a.cover_medium.clone())
-            }),
-            ..Default::default()
+    pub async fn search(&self, query: &SearchQuery, alternate: bool) -> Vec<Candidate> {
+        let term = if alternate {
+            let alt = query.alternate_term();
+            if alt == query.term() {
+                format!("track:\"{}\"", query.title.replace('"', " "))
+            } else {
+                alt
+            }
+        } else {
+            query.term()
         };
-
-        if let Some(contribs) = track.contributors {
-            for c in contribs {
-                data.contributors.push(c.name);
-            }
-        }
-
-        // Fetch release date from track details in parallel if possible
-        if let Ok(resp) = self
-            .client
-            .get(format!("https://api.deezer.com/track/{}", track_id))
-            .send()
-            .await
-        {
-            if let Ok(details) = resp.json::<DeezerTrackDetails>().await {
-                if let Some(date_str) = details.release_date {
-                    if let Some(year_str) = date_str.split('-').next() {
-                        if let Ok(yr) = year_str.parse::<i32>() {
-                            if yr > 1900 && yr < 2100 {
-                                data.release_year = Some(yr);
-                            }
-                        }
-                    }
-                }
-                if let Some(extra_contribs) = details.contributors {
-                    for c in extra_contribs {
-                        if !data.contributors.contains(&c.name) {
-                            data.contributors.push(c.name);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fetch genre from album details if available
-        if let Some(aid) = album_id {
-            if let Ok(resp) = self
-                .client
-                .get(format!("https://api.deezer.com/album/{}", aid))
-                .send()
-                .await
-            {
-                if let Ok(album_details) = resp.json::<DeezerAlbumDetails>().await {
-                    if let Some(genres) = album_details.genres {
-                        if let Some(list) = genres.data {
-                            if let Some(first) = list.into_iter().next() {
-                                data.genre = Some(first.name);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Some(data)
+        self.search_term(&term).await.unwrap_or_default()
     }
 
-    async fn execute_search(&self, query: &str) -> Option<Vec<DeezerTrackItem>> {
-        let url = format!(
-            "https://api.deezer.com/search?q={}&limit=3",
-            urlencoding::encode(query)
+    async fn search_term(&self, term: &str) -> Option<Vec<Candidate>> {
+        let response: SearchResponse = self
+            .client
+            .get("https://api.deezer.com/search")
+            .query(&[("q", term), ("limit", "16")])
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        Some(
+            response
+                .data
+                .into_iter()
+                .map(Track::into_candidate)
+                .collect(),
+        )
+    }
+
+    pub async fn add_details(&self, candidate: &mut Candidate, need_genre: bool) {
+        let album_id = candidate.release_id.as_deref().filter(|_| need_genre);
+        let (details, genre) = tokio::join!(
+            self.track_details(&candidate.id),
+            self.album_genre(album_id)
         );
-        let resp = self.client.get(&url).send().await.ok()?;
-        let search_res: DeezerSearchResponse = resp.json().await.ok()?;
-        search_res.data
+        if let Some(details) = details {
+            add_contributors(&mut candidate.recording.artists, details.contributors);
+            candidate.recording.year = details.release_date.as_deref().and_then(year_from_date);
+            candidate.recording.track_number =
+                details.track_position.or(candidate.recording.track_number);
+        }
+        candidate.recording.genre = genre;
+    }
+
+    async fn track_details(&self, id: &str) -> Option<TrackDetails> {
+        self.client
+            .get(format!("https://api.deezer.com/track/{id}"))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+
+    async fn album_genre(&self, id: Option<&str>) -> Option<String> {
+        let id = id?;
+        let details: AlbumDetails = self
+            .client
+            .get(format!("https://api.deezer.com/album/{id}"))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        details.genres?.data.into_iter().next().map(|g| g.name)
     }
 }

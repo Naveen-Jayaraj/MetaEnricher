@@ -1,10 +1,24 @@
-pub mod cleaner;
-pub mod deezer;
-pub mod enricher;
-pub mod itunes;
+mod cleaner;
+mod deezer;
+mod enricher;
+mod itunes;
 pub mod lyrics;
-pub mod musicbrainz;
-pub mod web_search;
+mod matching;
+mod musicbrainz;
+mod web_search;
 
 pub use enricher::MetadataEnricher;
 pub use lyrics::LyricsAggregator;
+
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(3))
+        .user_agent(concat!(
+            "MetaEnricher/",
+            env!("CARGO_PKG_VERSION"),
+            " (https://github.com/Naveen-Jayaraj/OfflineMusic)"
+        ))
+        .build()
+        .expect("metadata HTTP client")
+}

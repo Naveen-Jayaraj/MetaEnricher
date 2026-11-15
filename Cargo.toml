@@ -14,6 +14,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1.11"
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 strsim = "0.11"
 moka = { version = "0.12", features = ["future"] }
 futures = "0.3"

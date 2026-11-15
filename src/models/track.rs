@@ -13,6 +13,7 @@ pub struct TrackEntity {
     pub title: String,
 
     /// Credited artist(s). Multiple artists separated by " / " (e.g. "The Weeknd / Daft Punk").
+    #[serde(default)]
     pub artist: String,
 
     /// Name of album or EP.
@@ -62,6 +63,10 @@ pub struct TrackEntity {
     /// Audio duration in milliseconds.
     #[serde(default)]
     pub duration_ms: i64,
+
+    /// Optional reference to the exact upload when catalog search is inconclusive.
+    #[serde(default, skip_serializing)]
+    pub youtube_id: Option<String>,
 
     /// Content URI or physical file path to audio stream.
     #[serde(alias = "uri", default)]

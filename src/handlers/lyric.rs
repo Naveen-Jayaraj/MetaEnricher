@@ -58,20 +58,32 @@ pub async fn lyric_file_download_handler(
     State(state): State<AppState>,
     Query(params): Query<LyricFileQueryParams>,
 ) -> Response {
-    let id = params.id.unwrap_or_else(|| "track".to_string());
+    let id = params.id.unwrap_or_default();
     let title = params.title.unwrap_or_default();
     let artist = params.artist.unwrap_or_default();
 
-    if title.is_empty() && artist.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Missing title and artist query parameters").into_response();
+    if id.is_empty() && title.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Provide a lyrics ID or track title",
+        )
+            .into_response();
     }
 
     if let Some(lrc_content) = state.lyrics.get_raw_lrc(&id, &title, &artist).await {
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, "text/plain; charset=utf-8".parse().unwrap());
+        headers.insert(
+            header::CONTENT_TYPE,
+            "text/plain; charset=utf-8".parse().unwrap(),
+        );
         headers.insert(
             header::CONTENT_DISPOSITION,
-            format!(r#"attachment; filename="{}.lrc""#, sanitize_filename(&title)).parse().unwrap(),
+            format!(
+                r#"attachment; filename="{}.lrc""#,
+                sanitize_filename(if title.is_empty() { &id } else { &title })
+            )
+            .parse()
+            .unwrap(),
         );
         (StatusCode::OK, headers, lrc_content).into_response()
     } else {
@@ -90,10 +102,15 @@ pub async fn lyric_file_by_id_handler(
 
     if let Some(lrc_content) = state.lyrics.get_raw_lrc(&id, &title, &artist).await {
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, "text/plain; charset=utf-8".parse().unwrap());
+        headers.insert(
+            header::CONTENT_TYPE,
+            "text/plain; charset=utf-8".parse().unwrap(),
+        );
         headers.insert(
             header::CONTENT_DISPOSITION,
-            format!(r#"attachment; filename="{}.lrc""#, id).parse().unwrap(),
+            format!(r#"attachment; filename="{}.lrc""#, sanitize_filename(&id))
+                .parse()
+                .unwrap(),
         );
         (StatusCode::OK, headers, lrc_content).into_response()
     } else {
@@ -103,6 +120,12 @@ pub async fn lyric_file_by_id_handler(
 
 fn sanitize_filename(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }

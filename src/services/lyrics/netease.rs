@@ -1,114 +1,138 @@
-#![allow(dead_code)]
-
+use super::LyricMatch;
+use crate::services::matching::{
+    duration_delta, rank_candidates, Candidate, Recording, SearchQuery, Source,
+};
+use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
-use std::time::Duration;
+use std::sync::LazyLock;
 
-#[derive(Debug, Clone)]
-pub struct NetEaseLyricsService {
+static TIMESTAMP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\d{1,3}:\d{2}(?:[.:]\d+)?\]").unwrap());
+
+pub(super) struct NetEaseLyricsService {
     client: Client,
 }
 
-#[derive(Debug, Deserialize)]
-struct NetEaseSearchResponse {
-    result: Option<NetEaseSearchResult>,
+#[derive(Deserialize)]
+struct SearchResponse {
+    result: Option<SearchResult>,
 }
 
-#[derive(Debug, Deserialize)]
-struct NetEaseSearchResult {
-    songs: Option<Vec<NetEaseSongItem>>,
+#[derive(Deserialize)]
+struct SearchResult {
+    #[serde(default)]
+    songs: Vec<Song>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct NetEaseSongItem {
-    pub id: i64,
-    pub name: String,
+#[derive(Deserialize)]
+struct Song {
+    id: i64,
+    name: String,
+    #[serde(default, alias = "ar")]
+    artists: Vec<Name>,
+    #[serde(alias = "al")]
+    album: Option<Name>,
+    #[serde(alias = "dt")]
+    duration: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct NetEaseLyricResponse {
-    lrc: Option<NetEaseLrcObject>,
-    tlyric: Option<NetEaseLrcObject>,
+#[derive(Deserialize)]
+struct Name {
+    name: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct NetEaseLrcObject {
-    lyric: Option<String>,
+#[derive(Deserialize)]
+struct LyricsResponse {
+    lrc: Option<Lrc>,
 }
 
-#[derive(Debug, Clone)]
-pub struct NetEaseResult {
-    pub synced_lyrics: Option<String>,
-    pub plain_lyrics: Option<String>,
-    pub source: String,
+#[derive(Deserialize)]
+struct Lrc {
+    lyric: String,
 }
 
 impl NetEaseLyricsService {
-    pub fn new() -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .build()
-            .unwrap_or_else(|_| Client::new());
+    pub fn new(client: Client) -> Self {
         Self { client }
     }
 
-    pub async fn fetch_lyrics(&self, title: &str, artist: &str) -> Option<NetEaseResult> {
-        let query = format!("{} {}", title, artist);
-        let search_url = format!(
-            "https://music.163.com/api/search/get/web?s={}&type=1&offset=0&limit=3",
-            urlencoding::encode(&query)
-        );
-
-        let search_resp = self.client.get(&search_url).send().await.ok()?;
-        let search_json: NetEaseSearchResponse = search_resp.json().await.ok()?;
-        let songs = search_json.result?.songs?;
-        let song_id = songs.into_iter().next()?.id;
-
-        let lyric_url = format!(
-            "https://music.163.com/api/song/lyric?id={}&lv=1&kv=1&tv=-1",
-            song_id
-        );
-
-        let lyric_resp = self.client.get(&lyric_url).send().await.ok()?;
-        let lyric_json: NetEaseLyricResponse = lyric_resp.json().await.ok()?;
-        let raw_lrc = lyric_json.lrc?.lyric?;
-
-        if raw_lrc.trim().is_empty() {
-            return None;
-        }
-
-        // Check if contains timestamp [00:
-        let has_timestamps = raw_lrc.contains("[00:") || raw_lrc.contains("[01:") || raw_lrc.contains("[02:");
-
-        let (synced, plain) = if has_timestamps {
-            let plain = strip_lrc_timestamps(&raw_lrc);
-            (Some(raw_lrc), Some(plain))
-        } else {
-            (None, Some(raw_lrc))
-        };
-
-        Some(NetEaseResult {
-            synced_lyrics: synced,
-            plain_lyrics: plain,
-            source: "NetEase".to_string(),
+    pub async fn find(&self, query: &SearchQuery) -> Option<LyricMatch> {
+        let result: SearchResponse = self
+            .client
+            .get("https://music.163.com/api/search/get/web")
+            .query(&[
+                ("s", query.term().as_str()),
+                ("type", "1"),
+                ("offset", "0"),
+                ("limit", "12"),
+            ])
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let candidates: Vec<_> = result
+            .result?
+            .songs
+            .into_iter()
+            .map(|song| {
+                Candidate::new(
+                    Source::NetEase,
+                    song.id.to_string(),
+                    Recording {
+                        title: song.name,
+                        artists: song.artists.into_iter().map(|a| a.name).collect(),
+                        album: song.album.map(|a| a.name),
+                        duration_ms: song.duration,
+                        ..Recording::default()
+                    },
+                )
+            })
+            .collect();
+        let candidate = rank_candidates(query, &candidates).into_iter().next()?;
+        let text = self.fetch_lyrics(&candidate.id).await;
+        let timed = text.as_deref().is_some_and(|lrc| TIMESTAMP.is_match(lrc));
+        let same_duration = query.duration_ms.is_none()
+            || duration_delta(query.duration_ms, candidate.recording.duration_ms)
+                .is_some_and(|d| d <= 3_000);
+        let plain = text
+            .as_deref()
+            .map(|lrc| {
+                lrc.lines()
+                    .filter_map(|line| {
+                        let line = TIMESTAMP.replace_all(line, "");
+                        let clean = line.trim();
+                        (!clean.is_empty() && !clean.starts_with('[')).then(|| clean.to_owned())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|text| !text.is_empty());
+        Some(LyricMatch {
+            candidate,
+            synced: text.filter(|_| timed && same_duration),
+            plain,
+            instrumental: false,
         })
     }
-}
 
-fn strip_lrc_timestamps(lrc: &str) -> String {
-    let mut lines = Vec::new();
-    for line in lrc.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.contains(']') {
-            let idx = trimmed.rfind(']').unwrap();
-            let text = trimmed[idx + 1..].trim();
-            if !text.is_empty() {
-                lines.push(text);
-            }
-        } else if !trimmed.is_empty() {
-            lines.push(trimmed);
-        }
+    async fn fetch_lyrics(&self, id: &str) -> Option<String> {
+        let result: LyricsResponse = self
+            .client
+            .get("https://music.163.com/api/song/lyric")
+            .query(&[("id", id), ("lv", "1")])
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        Some(result.lrc?.lyric)
     }
-    lines.join("\n")
 }

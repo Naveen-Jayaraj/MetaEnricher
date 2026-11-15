@@ -8,21 +8,12 @@ MetaEnricher is a high-performance external backend written in Rust using Tokio 
 
 ## ⚡ Core Features
 
-1. **Extreme Deep Search & Web Disambiguation Engine**:
-   - **Google & DuckDuckGo Web Disambiguation**: Solves messy real-world metadata where song titles and artists are intermixed, or where the artist string includes movie names and multiple production credits (e.g., `artist: "Pa Va, P Jayachandran, Santhosh Varma, Anand Madhusoodanan"`).
-   - Automatically disentangles and maps:
-     - **Movie Name** (`Pa Va`) &rarr; sets `album = "Pa Va"` and strips it from artist.
-     - **Singer(s)** (`P. Jayachandran`) &rarr; sets canonical `artist`.
-     - **Music Director / Composer** (`Anand Madhusoodanan`) &rarr; sets `composer`.
-     - **Lyricist** (`Santhosh Varma`) &rarr; sets `composer` / credits.
-     - **Producer** (`Siyad Muhammed`) &rarr; sets `producer`.
-   - **Swapped / Intermixed Detection**: Reverses swapped titles and artist names (e.g. `title: "P Jayachandran"`, `artist: "podimmesha mulakkana kaalam"`).
-   - Sanitizes messy filenames & YouTube titles (e.g. `(Official Video)`, `[4K]`, `[HD]`, `[Clean Audio]`, pipe suffixes).
-   - Formats credited artists canonically separated by `" / "` (e.g., `"The Weeknd / Daft Punk"`).
-   - Cross-queries **Deezer**, **iTunes / Apple Music**, **MusicBrainz**, and **LRCLIB** concurrently with resolved canonical tokens.
-   - Enriches extended creative metadata: **`composer`**, **`producer`**, vocal **`language`**, and **`mood`** classification (e.g. *Chill*, *Energetic*, *Dark*, *Focus*, *Melancholic*, *Uplifting*).
-   - Fetches ultra high-resolution artwork (`1200x1200bb` / `cover_xl`).
-   - Automatically sets `metachecked = true` and `metadataStatus = "CONFIRMED"`.
+1. **Recording and release matching**
+   - Searches **Deezer**, **iTunes / Apple Music**, **MusicBrainz**, and **LRCLIB** concurrently. It ranks recordings by title, credited artists, album, and duration.
+   - Combines compatible artist credits using `" / "`. A search for `Happier` by `Marshmello` can return `Marshmello / Bastille`.
+   - Cleans filename and video labels while keeping live, acoustic, and remix versions distinct. Alternative storefronts, title and artist variants, **NetEase**, and verified or structured YouTube metadata help with harder searches.
+   - Fetches recording and work credits, release-specific artwork and track numbers, and lyrics when the sources supply them. Album and duration hints improve precision.
+   - Confirms tracks when the lookup finds a supported match. On a miss, the response preserves the supplied tags and sets `audit.matched = false`.
 
 2. **Wilooper/Lyrica-Inspired Lyrics Aggregator**:
    - Multi-source fallback: **LRCLIB** + **NetEase Cloud Music**.
@@ -33,7 +24,7 @@ MetaEnricher is a high-performance external backend written in Rust using Tokio 
    - **Axum 0.8** & **Tokio** asynchronous runtime with sub-millisecond in-memory **Moka TTL cache**.
    - **API Key & HTTP Basic Auth**: Locks API endpoints so only your authorized Android app can connect.
    - **Sliding-Window Rate Limiter**: 60 requests/minute per client IP (extracts IP from Cloudflare, Render `X-Forwarded-For`, etc.), returning `429 Too Many Requests` + `Retry-After: 60`.
-   - Bounded concurrency semaphore for batch requests to maintain peak throughput without getting rate-limited.
+   - Bounded batch concurrency and shared request limits reduce pressure on upstream catalogs.
    - 15MB request limits and permissive CORS for native Android integration.
 
 4. **Built-in Dark-Mode Visual Dashboard**:
@@ -50,7 +41,7 @@ Every enriched song produced by MetaEnricher conforms directly to OfflineMusic's
 | `title` | `Starboy` | **CORRECTED** | `String` | Cleaned track title stripped of YouTube tags, resolutions, and video labels. |
 | `artist` | `The Weeknd / Daft Punk` | **CORRECTED** | `String` | Credited primary and featured artists canonically formatted with `" / "`. |
 | `album` | `Starboy` | **DISCOVERED** | `String?` | Official studio album or movie/soundtrack name discovered via deep search. |
-| `year` | `2016` | **DISCOVERED** | `Int?` | Canonical original release year. |
+| `year` | `2016` | **DISCOVERED** | `Int?` | Release year of the matched edition. |
 | `genre` | `R&B/Soul` | **DISCOVERED** | `String?` | Canonical musical genre (e.g. Pop, Electronic, Rock, R&B/Soul). |
 | `trackNumber` | `1` | **DISCOVERED** | `Int?` | Official index position of the track on the album or CD. |
 | `producer` | `—` | **Verified** | `String?` | Credited music producer(s) or recording engineer. |
@@ -112,6 +103,7 @@ You can customize credentials easily via environment variables in Render or Dock
 
 ### 1. Single Song Metadata (`song`)
 * **Endpoint:** `PUT /song` (also accepts `POST /song`, `PUT /api/enrich-metadata`)
+* Supply an optional `youtubeId` in the body or query string to reference a specific YouTube upload.
 * **Headers:** `X-API-Key: metaenricher_secret_key`, `Content-Type: application/json`
 * **Request Body:**
 ```json
