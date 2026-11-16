@@ -1,6 +1,7 @@
 use crate::services::cleaner::{clean_catalog_title, clean_track, featured_artists, split_artists};
 use icu_normalizer::DecomposingNormalizer;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use strsim::normalized_levenshtein;
 
@@ -15,8 +16,8 @@ static VERSION_WORD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(?:live|remix|mix|karaoke|instrumental|acoustic|cover|sped up|slowed|reverb|nightcore|demo|stripped|edit|extended|remaster(?:ed)?|re recorded|session|alternate|version|clean|explicit|reprise)\b").unwrap()
 });
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct SearchQuery {
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct SearchQuery {
     pub title: String,
     pub artists: Vec<String>,
     pub album: Option<String>,
@@ -70,6 +71,19 @@ impl SearchQuery {
         }
     }
 
+    pub fn cache_key(&self) -> String {
+        let title = self.title.trim().to_lowercase();
+        let artist = self.artists.first().map(|s| s.trim().to_lowercase()).unwrap_or_default();
+        let album = self.album.as_deref().map(|s| s.trim().to_lowercase()).unwrap_or_default();
+        if let Some(yt) = &self.youtube_id {
+            format!("yt:{}|t:{}|a:{}", yt, title, artist)
+        } else if !album.is_empty() {
+            format!("t:{}|a:{}|al:{}", title, artist, album)
+        } else {
+            format!("t:{}|a:{}", title, artist)
+        }
+    }
+
     pub fn set_youtube_id(&mut self, id: Option<&str>) {
         self.youtube_id = id
             .filter(|id| {
@@ -117,8 +131,8 @@ impl SearchQuery {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Source {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Source {
     MusicBrainz,
     Deezer,
     ITunes,
@@ -147,8 +161,8 @@ impl Source {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub(super) struct Recording {
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct Recording {
     pub title: String,
     pub artists: Vec<String>,
     pub aliases: Vec<String>,
@@ -164,8 +178,8 @@ pub(super) struct Recording {
     pub tags: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct Candidate {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Candidate {
     pub source: Source,
     pub id: String,
     pub release_id: Option<String>,

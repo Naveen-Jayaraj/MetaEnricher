@@ -1,4 +1,5 @@
 mod cleaner;
+pub mod db;
 mod deezer;
 mod enricher;
 mod itunes;
@@ -7,6 +8,7 @@ mod matching;
 mod musicbrainz;
 mod web_search;
 
+pub use db::DatabaseService;
 pub use enricher::MetadataEnricher;
 pub use lyrics::LyricsAggregator;
 

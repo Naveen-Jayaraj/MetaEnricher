@@ -9,6 +9,7 @@ use crate::services::matching::{
 };
 use crate::services::musicbrainz::MusicBrainzService;
 use crate::services::web_search::WebSearchService;
+use crate::services::DatabaseService;
 use moka::future::Cache;
 use moka::Expiry;
 use std::sync::Arc;
@@ -21,14 +22,15 @@ pub struct MetadataEnricher {
     web_search: WebSearchService,
     lyrics: Arc<LyricsAggregator>,
     cache: Cache<SearchQuery, Arc<Discovery>>,
+    db: Option<Arc<DatabaseService>>,
 }
 
-#[derive(Default)]
-struct Discovery {
-    recording: Option<Recording>,
-    sources: Vec<&'static str>,
-    confidence: f32,
-    lyrics: Option<Arc<LyricMatch>>,
+#[derive(Default, Clone)]
+pub(crate) struct Discovery {
+    pub recording: Option<Recording>,
+    pub sources: Vec<String>,
+    pub confidence: f32,
+    pub lyrics: Option<Arc<LyricMatch>>,
 }
 
 struct DiscoveryExpiry;
@@ -52,7 +54,7 @@ impl Expiry<SearchQuery, Arc<Discovery>> for DiscoveryExpiry {
 }
 
 impl MetadataEnricher {
-    pub fn new(lyrics: Arc<LyricsAggregator>) -> Self {
+    pub fn new(lyrics: Arc<LyricsAggregator>, db: Option<Arc<DatabaseService>>) -> Self {
         let client = super::http_client();
         Self {
             deezer: DeezerService::new(client.clone()),
@@ -64,6 +66,7 @@ impl MetadataEnricher {
                 .max_capacity(10_000)
                 .expire_after(DiscoveryExpiry)
                 .build(),
+            db,
         }
     }
 
@@ -80,11 +83,43 @@ impl MetadataEnricher {
         let discovery = if query.title.is_empty() {
             Arc::new(Discovery::default())
         } else {
-            self.cache
-                .get_with_by_ref(&query.key(), async {
-                    Arc::new(self.discover(&query).await)
-                })
-                .await
+            // 1. Check in-memory Moka cache (L1)
+            if let Some(cached) = self.cache.get(&query.key()).await {
+                cached
+            } else {
+                // 2. Check Neon PostgreSQL database cache (L2)
+                let db_cached = if let Some(db) = &self.db {
+                    db.get_metadata(&query).await.map(Arc::new)
+                } else {
+                    None
+                };
+
+                if let Some(cached) = db_cached {
+                    self.cache.insert(query.key(), cached.clone()).await;
+                    cached
+                } else {
+                    // 3. Search and aggregate across external providers
+                    let discovered = self.discover(&query).await;
+                    let arc_disc = Arc::new(discovered);
+
+                    // 4. When any metadata is found, cache it to Neon
+                    if arc_disc.recording.is_some() {
+                        if let Some(db) = &self.db {
+                            let db = db.clone();
+                            let q = query.clone();
+                            let d = arc_disc.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = db.save_metadata(&q, &d).await {
+                                    tracing::warn!("Failed to cache metadata to Neon: {e}");
+                                }
+                            });
+                        }
+                    }
+
+                    self.cache.insert(query.key(), arc_disc.clone()).await;
+                    arc_disc
+                }
+            }
         };
         let response = apply_discovery(track, &discovery);
         if let Some(lyrics) = &discovery.lyrics {
@@ -247,7 +282,7 @@ impl MetadataEnricher {
         let recording = merge_recordings(&query, &matched);
         Discovery {
             recording: Some(recording),
-            sources: matched.iter().map(|c| c.source.name()).collect(),
+            sources: matched.iter().map(|c| c.source.name().to_string()).collect(),
             confidence,
             lyrics: best_lyrics.map(Arc::new),
         }
@@ -460,11 +495,7 @@ fn apply_discovery(mut track: TrackEntity, discovery: &Discovery) -> SingleSongR
         confidence_score: discovery.confidence,
         fields_updated: Vec::new(),
         fields_corrected: Vec::new(),
-        sources_consulted: discovery
-            .sources
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect(),
+        sources_consulted: discovery.sources.clone(),
         raw_title_cleaned: title_cleaned,
         artists_reformatted: artist_reformatted,
         artwork_enhanced,

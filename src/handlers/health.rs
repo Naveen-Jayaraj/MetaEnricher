@@ -14,6 +14,9 @@ pub struct HealthStatus {
     pub total_lyric_requests: u64,
     pub metadata_cache_size: u64,
     pub lyrics_cache_size: u64,
+    pub database_connected: bool,
+    pub neon_metadata_cached: u64,
+    pub neon_lyrics_cached: u64,
 }
 
 pub async fn health_handler(State(state): State<AppState>) -> Json<HealthStatus> {
@@ -22,6 +25,13 @@ pub async fn health_handler(State(state): State<AppState>) -> Json<HealthStatus>
     let lyric_requests = state.total_lyric_requests.load(Ordering::Relaxed);
     let meta_cache = state.enricher.cache_size();
     let lyric_cache = state.lyrics.cache_size();
+
+    let (db_connected, neon_meta, neon_lyrics) = if let Some(db) = &state.db {
+        let (m, l) = db.counts().await;
+        (true, m, l)
+    } else {
+        (false, 0, 0)
+    };
 
     Json(HealthStatus {
         status: "ok".to_string(),
@@ -32,5 +42,8 @@ pub async fn health_handler(State(state): State<AppState>) -> Json<HealthStatus>
         total_lyric_requests: lyric_requests,
         metadata_cache_size: meta_cache,
         lyrics_cache_size: lyric_cache,
+        database_connected: db_connected,
+        neon_metadata_cached: neon_meta,
+        neon_lyrics_cached: neon_lyrics,
     })
 }

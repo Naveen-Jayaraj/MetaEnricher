@@ -532,9 +532,9 @@ const DASHBOARD_HTML: &str = r###"<!DOCTYPE html>
           <input type="password" id="global-api-key" style="background:transparent; border:none; color:#a5b4fc; font-family:var(--mono); font-size:0.8rem; outline:none; width:170px;" placeholder="metaenricher_secret_key" oninput="saveApiKey(this.value)">
           <button onclick="toggleKeyVisibility()" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:0.75rem;" title="Toggle Visibility">👁️</button>
         </div>
-        <span class="status-badge">
+        <span class="status-badge" id="status-badge">
           <span class="status-dot"></span>
-          Engine Online &amp; Protected
+          Engine Online &bull; Neon DB Active
         </span>
       </div>
     </header>
@@ -552,9 +552,14 @@ const DASHBOARD_HTML: &str = r###"<!DOCTYPE html>
         <div class="stat-sub">Synced LRC &amp; plain</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Metadata Cache</div>
+        <div class="stat-label">Memory Cache (L1)</div>
         <div class="stat-value" id="stat-meta-cache">0</div>
         <div class="stat-sub">Hot entries in Moka</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Neon DB Cache (L2)</div>
+        <div class="stat-value" id="stat-neon-cache">0</div>
+        <div class="stat-sub">Persistent PostgreSQL</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Server Uptime</div>
@@ -840,6 +845,16 @@ if (enriched.success) {
           document.getElementById('stat-song-count').textContent = data.totalSongRequests;
           document.getElementById('stat-lyric-count').textContent = data.totalLyricRequests;
           document.getElementById('stat-meta-cache').textContent = data.metadataCacheSize;
+          if (document.getElementById('stat-neon-cache')) {
+            document.getElementById('stat-neon-cache').textContent = (data.neonMetadataCached || 0) + ' items';
+          }
+          if (document.getElementById('status-badge')) {
+            if (data.databaseConnected) {
+              document.getElementById('status-badge').innerHTML = '<span class="status-dot"></span> Engine Online &bull; Neon DB Active';
+            } else {
+              document.getElementById('status-badge').innerHTML = '<span class="status-dot" style="background:#f59e0b;"></span> Engine Online &bull; In-Memory Only';
+            }
+          }
           document.getElementById('stat-uptime').textContent = data.uptimeSeconds + 's';
         }
       } catch (e) {}

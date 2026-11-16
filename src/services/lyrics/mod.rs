@@ -2,7 +2,8 @@ mod lrclib;
 mod netease;
 
 use crate::models::{LyricQuery, LyricResponse};
-use crate::services::matching::{Candidate, SearchQuery};
+use crate::services::matching::{Candidate, Recording, SearchQuery, Source};
+use crate::services::DatabaseService;
 use lrclib::LrclibService;
 use moka::future::Cache;
 use netease::NetEaseLyricsService;
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
-pub(super) struct LyricMatch {
+pub(crate) struct LyricMatch {
     pub candidate: Candidate,
     pub synced: Option<String>,
     pub plain: Option<String>,
@@ -32,6 +33,38 @@ impl LyricMatch {
         self.has_lyrics()
             .then(|| format!("/lyric/file?id={}", self.id()))
     }
+
+    pub fn new_cached(
+        source_name: &str,
+        id: &str,
+        title: &str,
+        artist: &str,
+        synced: Option<String>,
+        plain: Option<String>,
+        instrumental: bool,
+    ) -> Self {
+        let source = match source_name.to_lowercase().as_str() {
+            "netease" => Source::NetEase,
+            _ => Source::Lrclib,
+        };
+        let recording = Recording {
+            title: title.to_string(),
+            artists: vec![artist.to_string()],
+            ..Default::default()
+        };
+        let candidate = Candidate {
+            source,
+            id: id.to_string(),
+            release_id: None,
+            recording,
+        };
+        Self {
+            candidate,
+            synced,
+            plain,
+            instrumental,
+        }
+    }
 }
 
 pub struct LyricsAggregator {
@@ -39,10 +72,11 @@ pub struct LyricsAggregator {
     netease: NetEaseLyricsService,
     cache: Cache<SearchQuery, Arc<LyricMatch>>,
     by_id: Cache<String, Arc<LyricMatch>>,
+    db: Option<Arc<DatabaseService>>,
 }
 
 impl LyricsAggregator {
-    pub fn new() -> Self {
+    pub fn new(db: Option<Arc<DatabaseService>>) -> Self {
         let client = super::http_client();
         Self {
             lrclib: LrclibService::new(client.clone()),
@@ -55,6 +89,7 @@ impl LyricsAggregator {
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(86_400))
                 .build(),
+            db,
         }
     }
 
@@ -69,7 +104,16 @@ impl LyricsAggregator {
     pub(super) async fn remember(&self, query: &SearchQuery, hit: Arc<LyricMatch>) {
         if hit.has_lyrics() {
             self.by_id.insert(hit.id(), Arc::clone(&hit)).await;
-            self.cache.insert(query.key(), hit).await;
+            self.cache.insert(query.key(), hit.clone()).await;
+
+            if let Some(db) = &self.db {
+                let db = db.clone();
+                let query = query.clone();
+                let hit = hit.clone();
+                tokio::spawn(async move {
+                    let _ = db.save_lyrics(&query, &hit).await;
+                });
+            }
         }
     }
 
@@ -84,17 +128,48 @@ impl LyricsAggregator {
         let found = if signature.title.is_empty() {
             None
         } else {
-            self.cache
-                .try_get_with_by_ref(&signature.key(), async {
-                    if let Some(hit) = self.find_lrclib(&signature).await {
+            // 1. Check in-memory cache
+            if let Some(hit) = self.cache.get(&signature.key()).await {
+                Some(hit)
+            } else {
+                // 2. Check Neon PostgreSQL persistent cache
+                let db_hit = if let Some(db) = &self.db {
+                    db.get_lyrics(&signature).await.map(Arc::new)
+                } else {
+                    None
+                };
+
+                if let Some(hit) = db_hit {
+                    self.cache.insert(signature.key(), hit.clone()).await;
+                    Some(hit)
+                } else {
+                    // 3. Query LRCLIB and NetEase
+                    let api_hit = if let Some(hit) = self.find_lrclib(&signature).await {
                         if hit.has_lyrics() || hit.instrumental {
-                            return Ok(Arc::new(hit));
+                            Some(Arc::new(hit))
+                        } else {
+                            self.find_netease(&signature).await.map(Arc::new)
+                        }
+                    } else {
+                        self.find_netease(&signature).await.map(Arc::new)
+                    };
+
+                    if let Some(hit) = &api_hit {
+                        if hit.has_lyrics() || hit.instrumental {
+                            self.cache.insert(signature.key(), hit.clone()).await;
+                            if let Some(db) = &self.db {
+                                let db = db.clone();
+                                let sig = signature.clone();
+                                let h = hit.clone();
+                                tokio::spawn(async move {
+                                    let _ = db.save_lyrics(&sig, &h).await;
+                                });
+                            }
                         }
                     }
-                    self.find_netease(&signature).await.map(Arc::new).ok_or(())
-                })
-                .await
-                .ok()
+                    api_hit
+                }
+            }
         };
         let mut response = LyricResponse {
             id: query.id.clone().unwrap_or_else(|| {

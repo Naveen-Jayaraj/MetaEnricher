@@ -14,3 +14,5 @@ services:
         value: metaenricher_secret
       - key: RATE_LIMIT_PER_MINUTE
         value: "60"
+      - key: DATABASE_URL
+        value: postgresql://neondb_owner:npg_VT3XHKRoMil2@ep-flat-heart-bbtb6258-pooler.c-15.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require

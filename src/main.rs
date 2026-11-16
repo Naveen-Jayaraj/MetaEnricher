@@ -12,7 +12,7 @@ use axum::{
 };
 use handlers::*;
 use security::{security_middleware, SecurityConfig};
-use services::{LyricsAggregator, MetadataEnricher};
+use services::{DatabaseService, LyricsAggregator, MetadataEnricher};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -25,6 +25,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 pub struct AppState {
     pub enricher: Arc<MetadataEnricher>,
     pub lyrics: Arc<LyricsAggregator>,
+    pub db: Option<Arc<DatabaseService>>,
     pub start_time: Instant,
     pub total_song_requests: Arc<AtomicU64>,
     pub total_lyric_requests: Arc<AtomicU64>,
@@ -44,13 +45,30 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Initializing MetaEnricher Core Services...");
 
-    let lyrics_aggregator = Arc::new(LyricsAggregator::new());
-    let metadata_enricher = Arc::new(MetadataEnricher::new(lyrics_aggregator.clone()));
+    // Connect to Neon PostgreSQL database
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgresql://neondb_owner:npg_VT3XHKRoMil2@ep-flat-heart-bbtb6258-pooler.c-15.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require".to_string()
+    });
+
+    let db_service = match DatabaseService::connect(&database_url).await {
+        Ok(db) => {
+            tracing::info!("Neon PostgreSQL database connected and initialized.");
+            Some(Arc::new(db))
+        }
+        Err(e) => {
+            tracing::warn!("Could not connect to Neon PostgreSQL database: {e}. Falling back to in-memory caching.");
+            None
+        }
+    };
+
+    let lyrics_aggregator = Arc::new(LyricsAggregator::new(db_service.clone()));
+    let metadata_enricher = Arc::new(MetadataEnricher::new(lyrics_aggregator.clone(), db_service.clone()));
     let security_config = Arc::new(SecurityConfig::from_env());
 
     let app_state = AppState {
         enricher: metadata_enricher,
         lyrics: lyrics_aggregator,
+        db: db_service,
         start_time: Instant::now(),
         total_song_requests: Arc::new(AtomicU64::new(0)),
         total_lyric_requests: Arc::new(AtomicU64::new(0)),

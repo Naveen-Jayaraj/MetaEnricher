@@ -20,8 +20,11 @@ MetaEnricher is a high-performance external backend written in Rust using Tokio 
    - Retrieves line-synchronized lyrics (`.lrc` with `[mm:ss.xx]` timestamps) and plain text lyrics.
    - Direct raw `.lrc` download endpoint (`GET /lyric/file`) designed specifically for Android `lyricsUri` file caching.
 
-3. **High-Speed & Secure Rust Architecture**:
-   - **Axum 0.8** & **Tokio** asynchronous runtime with sub-millisecond in-memory **Moka TTL cache**.
+3. **High-Speed, Persistent & Secure Rust Architecture**:
+   - **Dual-Tier Cache Hierarchy**:
+     - **L1 In-Memory Cache**: Ultra-fast **Moka** future TTL cache (<0.1ms access time).
+     - **L2 Persistent Cloud Database**: **Neon Serverless PostgreSQL** automatically caches all discovered metadata and synchronized `.lrc` lyrics to survive Render free-tier restarts and share cache across multiple instances.
+   - **Axum 0.8** & **Tokio** asynchronous runtime.
    - **API Key & HTTP Basic Auth**: Locks API endpoints so only your authorized Android app can connect.
    - **Sliding-Window Rate Limiter**: 60 requests/minute per client IP (extracts IP from Cloudflare, Render `X-Forwarded-For`, etc.), returning `429 Too Many Requests` + `Retry-After: 60`.
    - Bounded batch concurrency and shared request limits reduce pressure on upstream catalogs.
@@ -242,7 +245,10 @@ You can customize credentials easily via environment variables in Render or Dock
   "totalSongRequests": 24,
   "totalLyricRequests": 18,
   "metadataCacheSize": 12,
-  "lyricsCacheSize": 9
+  "lyricsCacheSize": 9,
+  "databaseConnected": true,
+  "neonMetadataCached": 154,
+  "neonLyricsCached": 112
 }
 ```
 
@@ -412,9 +418,16 @@ Open `http://localhost:8080` to access the interactive web dashboard!
    ```
 2. Go to **[dashboard.render.com](https://dashboard.render.com)** and sign in with GitHub (No credit card required).
 3. Click **New +** &rarr; **Blueprint** and select your `MetaEnricher` repository (or **New +** &rarr; **Web Service** with runtime `Docker` and plan `Free`).
-4. Click **Apply**.
-5. Once deployed, Render provides your permanent HTTPS URL:
+4. **Environment Variables**:
+   `render.yaml` automatically sets:
+   - `DATABASE_URL`: Your Neon PostgreSQL connection string (`postgresql://neondb_owner:...@ep-flat-heart-bbtb6258-pooler.c-15.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require`)
+   - `API_KEY`: Secret key for Android authorization (`metaenricher_secret_key`)
+   - `AUTH_USERNAME`: Dashboard basic auth user (`admin`)
+   - `AUTH_PASSWORD`: Dashboard basic auth password (`metaenricher_secret`)
+   - `RATE_LIMIT_PER_MINUTE`: 60
+5. Click **Apply**.
+6. Once deployed, Render provides your permanent HTTPS URL:
    ```text
    https://meta-enricher-xxxx.onrender.com
    ```
-   Paste this into your Android app's `ApiClient.kt` and enjoy fast, secure, automated metadata enrichment!
+   Paste this into your Android app's `ApiClient.kt` and enjoy fast, secure, persistent automated metadata enrichment!
