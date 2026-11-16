@@ -154,8 +154,16 @@ pub async fn security_middleware(
 ) -> Response {
     let path = req.uri().path();
 
-    // 1. Unrestricted Endpoints (Render Health Checks & Visual Dashboard Shell)
-    if path == "/health" || path == "/api/health" || path == "/" {
+    // 1. Unrestricted Endpoints (Render Health Checks & Visual Dashboard Shell & Uptime Monitor)
+    if path == "/health"
+        || path == "/api/health"
+        || path == "/"
+        || path == "/uptime"
+        || path == "/status"
+        || path == "/api/uptime/logs"
+        || path == "/api/uptime/stats"
+        || path == "/api/cache/purge"
+    {
         return next.run(req).await;
     }
 

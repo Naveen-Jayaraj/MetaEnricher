@@ -527,6 +527,10 @@ const DASHBOARD_HTML: &str = r###"<!DOCTYPE html>
         </div>
       </div>
       <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <a href="/uptime" style="text-decoration:none; display:inline-flex; align-items:center; gap:6px; color:#a5b4fc; background:rgba(99,102,241,0.12); border:1px solid rgba(99,102,241,0.3); padding:6px 14px; border-radius:var(--radius-sm); font-size:0.8rem; font-weight:600; transition:all 0.2s;" onmouseover="this.style.background='rgba(99,102,241,0.22)'" onmouseout="this.style.background='rgba(99,102,241,0.12)'">
+          <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+          ⚡ System Uptime &amp; Logs &rarr;
+        </a>
         <div style="display:flex; align-items:center; gap:8px; background:rgba(255,255,255,0.06); padding:6px 12px; border-radius:var(--radius-sm); border:1px solid var(--border);">
           <span style="font-size:0.75rem; color:var(--text-muted); font-weight:600;">API KEY:</span>
           <input type="password" id="global-api-key" style="background:transparent; border:none; color:#a5b4fc; font-family:var(--mono); font-size:0.8rem; outline:none; width:170px;" placeholder="metaenricher_secret_key" oninput="saveApiKey(this.value)">
@@ -552,19 +556,19 @@ const DASHBOARD_HTML: &str = r###"<!DOCTYPE html>
         <div class="stat-sub">Synced LRC &amp; plain</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Memory Cache (L1)</div>
+        <div class="stat-label">Render Memory (L1)</div>
         <div class="stat-value" id="stat-meta-cache">0</div>
-        <div class="stat-sub">Hot entries in Moka</div>
+        <div class="stat-sub">Ephemeral (Auto-purged every 2m)</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Neon DB Cache (L2)</div>
         <div class="stat-value" id="stat-neon-cache">0</div>
-        <div class="stat-sub">Persistent PostgreSQL</div>
+        <div class="stat-sub">Permanent cloud database</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Server Uptime</div>
         <div class="stat-value" id="stat-uptime">0s</div>
-        <div class="stat-sub">Blazing Tokio async runtime</div>
+        <div class="stat-sub">Continuous Tokio runtime</div>
       </div>
     </div>
 
@@ -836,28 +840,52 @@ if (enriched.success) {
       document.getElementById('tab-' + name).classList.add('active');
     }
 
+    // Format seconds into clean human-readable duration
+    function formatUptime(seconds) {
+      if (!seconds || seconds <= 0) return '0s';
+      const d = Math.floor(seconds / 86400);
+      const h = Math.floor((seconds % 86400) / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = seconds % 60;
+      if (d > 0) return `${d}d ${h}h`;
+      if (h > 0) return `${h}h ${m}m`;
+      if (m > 0) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+
+    function setElText(id, val, fallback = '0') {
+      const el = document.getElementById(id);
+      if (el) {
+        el.textContent = (val !== undefined && val !== null) ? val : fallback;
+      }
+    }
+
     // Refresh Server Stats
     async function updateStats() {
       try {
-        const res = await fetch('/health');
+        const res = await fetch('/health', { cache: 'no-store' });
         if (res.ok) {
           const data = await res.json();
-          document.getElementById('stat-song-count').textContent = data.totalSongRequests;
-          document.getElementById('stat-lyric-count').textContent = data.totalLyricRequests;
-          document.getElementById('stat-meta-cache').textContent = data.metadataCacheSize;
-          if (document.getElementById('stat-neon-cache')) {
-            document.getElementById('stat-neon-cache').textContent = (data.neonMetadataCached || 0) + ' items';
-          }
-          if (document.getElementById('status-badge')) {
+          setElText('stat-song-count', data.totalSongRequests ?? 0);
+          setElText('stat-lyric-count', data.totalLyricRequests ?? 0);
+          setElText('stat-meta-cache', (data.metadataCacheSize ?? 0) + ' hot');
+          setElText('stat-neon-cache', (data.neonMetadataCached ?? 0) + ' stored');
+          setElText('stat-uptime', formatUptime(data.uptimeSeconds ?? 0));
+
+          const badge = document.getElementById('status-badge');
+          if (badge) {
             if (data.databaseConnected) {
-              document.getElementById('status-badge').innerHTML = '<span class="status-dot"></span> Engine Online &bull; Neon DB Active';
+              badge.innerHTML = '<span class="status-dot"></span> Engine Online &bull; Neon DB Active';
             } else {
-              document.getElementById('status-badge').innerHTML = '<span class="status-dot" style="background:#f59e0b;"></span> Engine Online &bull; In-Memory Only';
+              badge.innerHTML = '<span class="status-dot" style="background:#f59e0b; box-shadow:0 0 8px #f59e0b;"></span> Engine Online &bull; Neon Reconnecting';
             }
           }
-          document.getElementById('stat-uptime').textContent = data.uptimeSeconds + 's';
+        } else {
+          console.warn('Health check returned status:', res.status);
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn('Failed to update stats:', e);
+      }
     }
     setInterval(updateStats, 3000);
     updateStats();

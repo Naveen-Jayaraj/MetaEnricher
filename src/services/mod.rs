@@ -6,11 +6,13 @@ mod itunes;
 pub mod lyrics;
 mod matching;
 mod musicbrainz;
+pub mod uptime;
 mod web_search;
 
 pub use db::DatabaseService;
 pub use enricher::MetadataEnricher;
 pub use lyrics::LyricsAggregator;
+pub use uptime::UptimeManager;
 
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()

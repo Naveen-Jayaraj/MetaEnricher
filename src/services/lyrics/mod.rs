@@ -83,11 +83,11 @@ impl LyricsAggregator {
             netease: NetEaseLyricsService::new(client),
             cache: Cache::builder()
                 .max_capacity(10_000)
-                .time_to_live(Duration::from_secs(86_400))
+                .time_to_live(Duration::from_secs(120))
                 .build(),
             by_id: Cache::builder()
                 .max_capacity(10_000)
-                .time_to_live(Duration::from_secs(86_400))
+                .time_to_live(Duration::from_secs(120))
                 .build(),
             db,
         }
@@ -229,5 +229,14 @@ impl LyricsAggregator {
 
     pub fn cache_size(&self) -> u64 {
         self.cache.entry_count()
+    }
+
+    /// Purges all in-memory lyrics entries from Render. Persistent lyrics remain in Neon DB.
+    pub async fn purge_memory_cache(&self) -> (u64, u64) {
+        let c1 = self.cache.entry_count();
+        let c2 = self.by_id.entry_count();
+        self.cache.invalidate_all();
+        self.by_id.invalidate_all();
+        (c1, c2)
     }
 }

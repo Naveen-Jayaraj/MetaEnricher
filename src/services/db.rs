@@ -1,14 +1,18 @@
 use crate::services::enricher::Discovery;
 use crate::services::lyrics::LyricMatch;
 use crate::services::matching::{Recording, SearchQuery};
+use crate::services::uptime::UptimeLogEntry;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 pub struct DatabaseService {
     pool: PgPool,
+    cached_meta_count: Arc<AtomicU64>,
+    cached_lyrics_count: Arc<AtomicU64>,
 }
 
 impl DatabaseService {
@@ -28,8 +32,15 @@ impl DatabaseService {
                 .await
             {
                 Ok(pool) => {
-                    let service = Self { pool };
+                    let service = Self {
+                        pool,
+                        cached_meta_count: Arc::new(AtomicU64::new(0)),
+                        cached_lyrics_count: Arc::new(AtomicU64::new(0)),
+                    };
                     service.run_migrations().await?;
+                    let (m, l) = service.counts().await;
+                    service.cached_meta_count.store(m, Ordering::Relaxed);
+                    service.cached_lyrics_count.store(l, Ordering::Relaxed);
                     return Ok(service);
                 }
                 Err(e) => {
@@ -118,6 +129,35 @@ impl DatabaseService {
             r#"
             CREATE INDEX IF NOT EXISTS idx_lyrics_cache_title_artist 
             ON lyrics_cache (LOWER(title), LOWER(artist))
+            "#
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS uptime_logs (
+                id BIGSERIAL PRIMARY KEY,
+                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                service VARCHAR(32) NOT NULL DEFAULT 'system',
+                render_status VARCHAR(32) NOT NULL,
+                render_uptime_seconds BIGINT NOT NULL,
+                neon_status VARCHAR(32) NOT NULL,
+                neon_latency_ms INT DEFAULT 0,
+                neon_metadata_count BIGINT DEFAULT 0,
+                neon_lyrics_count BIGINT DEFAULT 0,
+                event_type VARCHAR(64) NOT NULL DEFAULT 'HEARTBEAT',
+                message TEXT
+            )
+            "#
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_uptime_logs_timestamp 
+            ON uptime_logs (timestamp DESC)
             "#
         )
         .execute(&self.pool)
@@ -309,6 +349,8 @@ impl DatabaseService {
         .execute(&self.pool)
         .await?;
 
+        self.cached_meta_count.fetch_add(1, Ordering::Relaxed);
+
         // If lyrics are available, also cache into lyrics_cache
         if lyrics_available || instrumental {
             let lyric_key = format!("t:{}|a:{}", title.to_lowercase(), artist.to_lowercase());
@@ -427,7 +469,120 @@ impl DatabaseService {
         .execute(&self.pool)
         .await?;
 
+        self.cached_lyrics_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Fast non-blocking read of atomic cache counts (<1ns, zero DB overhead).
+    pub fn cached_counts(&self) -> (u64, u64) {
+        (
+            self.cached_meta_count.load(Ordering::Relaxed),
+            self.cached_lyrics_count.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Refresh atomic counters by querying COUNT(*) from Neon in the background.
+    pub async fn refresh_counts(&self) -> (u64, u64) {
+        let (m, l) = self.counts().await;
+        self.cached_meta_count.store(m, Ordering::Relaxed);
+        self.cached_lyrics_count.store(l, Ordering::Relaxed);
+        (m, l)
+    }
+
+    /// Measure real-time round-trip latency to Neon PostgreSQL in milliseconds.
+    pub async fn ping_latency(&self) -> Result<u32, sqlx::Error> {
+        let start = Instant::now();
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await?;
+        let elapsed = start.elapsed().as_millis().max(1) as u32;
+        Ok(elapsed)
+    }
+
+    /// Save an uptime / heartbeat log entry to Neon DB.
+    pub async fn save_uptime_log(&self, entry: &UptimeLogEntry) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO uptime_logs (
+                service, render_status, render_uptime_seconds, neon_status,
+                neon_latency_ms, neon_metadata_count, neon_lyrics_count,
+                event_type, message
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9
+            )
+            "#
+        )
+        .bind(&entry.service)
+        .bind(&entry.render_status)
+        .bind(entry.render_uptime_seconds as i64)
+        .bind(&entry.neon_status)
+        .bind(entry.neon_latency_ms.map(|ms| ms as i32))
+        .bind(entry.neon_metadata_count as i64)
+        .bind(entry.neon_lyrics_count as i64)
+        .bind(&entry.event_type)
+        .bind(&entry.message)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Retrieve the most recent uptime logs from Neon DB.
+    pub async fn get_recent_uptime_logs(&self, limit: i64) -> Result<Vec<UptimeLogEntry>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT 
+                id, timestamp, service, render_status, render_uptime_seconds,
+                neon_status, neon_latency_ms, neon_metadata_count, neon_lyrics_count,
+                event_type, message
+            FROM uptime_logs
+            ORDER BY timestamp DESC
+            LIMIT $1
+            "#
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut logs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.get("id");
+            let ts: chrono::DateTime<chrono::Utc> = row.get("timestamp");
+            let service: String = row.get("service");
+            let render_status: String = row.get("render_status");
+            let render_uptime: i64 = row.get("render_uptime_seconds");
+            let neon_status: String = row.get("neon_status");
+            let latency: Option<i32> = row.get("neon_latency_ms");
+            let meta_cnt: i64 = row.get("neon_metadata_count");
+            let lyrics_cnt: i64 = row.get("neon_lyrics_count");
+            let event_type: String = row.get("event_type");
+            let message: Option<String> = row.get("message");
+
+            logs.push(UptimeLogEntry {
+                id: Some(id),
+                timestamp: ts.to_rfc3339(),
+                service,
+                render_status,
+                render_uptime_seconds: render_uptime.max(0) as u64,
+                neon_status,
+                neon_latency_ms: latency.map(|ms| ms.max(0) as u32),
+                neon_metadata_count: meta_cnt.max(0) as u64,
+                neon_lyrics_count: lyrics_cnt.max(0) as u64,
+                event_type,
+                message: message.unwrap_or_default(),
+            });
+        }
+
+        Ok(logs)
+    }
+
+    /// Count total rows in uptime_logs table.
+    pub async fn uptime_logs_count(&self) -> u64 {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM uptime_logs")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
+        count.max(0) as u64
     }
 
     /// Get counts of cached entries in Neon (metadata_count, lyrics_count).

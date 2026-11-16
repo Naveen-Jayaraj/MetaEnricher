@@ -27,7 +27,7 @@ pub async fn health_handler(State(state): State<AppState>) -> Json<HealthStatus>
     let lyric_cache = state.lyrics.cache_size();
 
     let (db_connected, neon_meta, neon_lyrics) = if let Some(db) = &state.db {
-        let (m, l) = db.counts().await;
+        let (m, l) = db.cached_counts();
         (true, m, l)
     } else {
         (false, 0, 0)

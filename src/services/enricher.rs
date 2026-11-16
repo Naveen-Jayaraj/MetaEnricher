@@ -43,11 +43,9 @@ impl Expiry<SearchQuery, Arc<Discovery>> for DiscoveryExpiry {
         _created_at: Instant,
     ) -> Option<Duration> {
         let seconds = if value.recording.is_none() {
-            30
-        } else if value.sources.len() < 2 {
-            300
+            15
         } else {
-            86_400
+            120 // Ephemeral in-memory TTL on Render; Neon DB is the permanent storage
         };
         Some(Duration::from_secs(seconds))
     }
@@ -307,6 +305,13 @@ impl MetadataEnricher {
 
     pub fn cache_size(&self) -> u64 {
         self.cache.entry_count()
+    }
+
+    /// Purges all in-memory metadata entries from Render. Persistent metadata remains in Neon DB.
+    pub async fn purge_memory_cache(&self) -> u64 {
+        let count = self.cache.entry_count();
+        self.cache.invalidate_all();
+        count
     }
 }
 

@@ -12,7 +12,7 @@ use axum::{
 };
 use handlers::*;
 use security::{security_middleware, SecurityConfig};
-use services::{DatabaseService, LyricsAggregator, MetadataEnricher};
+use services::{DatabaseService, LyricsAggregator, MetadataEnricher, UptimeManager};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -26,6 +26,7 @@ pub struct AppState {
     pub enricher: Arc<MetadataEnricher>,
     pub lyrics: Arc<LyricsAggregator>,
     pub db: Option<Arc<DatabaseService>>,
+    pub uptime: Arc<UptimeManager>,
     pub start_time: Instant,
     pub total_song_requests: Arc<AtomicU64>,
     pub total_lyric_requests: Arc<AtomicU64>,
@@ -44,6 +45,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("Initializing MetaEnricher Core Services...");
+
+    let start_time = Instant::now();
 
     // Connect to Neon PostgreSQL database
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -65,11 +68,73 @@ async fn main() -> anyhow::Result<()> {
     let metadata_enricher = Arc::new(MetadataEnricher::new(lyrics_aggregator.clone(), db_service.clone()));
     let security_config = Arc::new(SecurityConfig::from_env());
 
+    // Initialize Dual-Store Uptime & Telemetry Manager
+    let uptime_manager = Arc::new(UptimeManager::new(start_time, db_service.clone()));
+    uptime_manager.init_from_database().await;
+
+    // Record system startup event in both Render and Neon DB
+    let is_db_connected = db_service.is_some();
+    uptime_manager
+        .record(services::uptime::UptimeLogEntry {
+            id: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            service: "system".to_string(),
+            render_status: "ONLINE".to_string(),
+            render_uptime_seconds: 0,
+            neon_status: if is_db_connected {
+                "ONLINE".to_string()
+            } else {
+                "OFFLINE".to_string()
+            },
+            neon_latency_ms: None,
+            neon_metadata_count: 0,
+            neon_lyrics_count: 0,
+            event_type: "STARTUP".to_string(),
+            message: "MetaEnricher engine initialized with dual-store cross-redundant uptime logging.".to_string(),
+        })
+        .await;
+
+    // Background Task 1: Periodic Heartbeat & Dual-Uptime Logging (Every 30s)
+    let uptime_hb = uptime_manager.clone();
+    let db_hb = db_service.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            uptime_hb.heartbeat().await;
+            if let Some(db) = &db_hb {
+                let _ = db.refresh_counts().await;
+            }
+        }
+    });
+
+    // Background Task 2: Periodic Render Memory Cleanup (Every 2 minutes)
+    // "dont store any metadata anything in render delete it periodically, only keep in neon"
+    let enricher_purge = metadata_enricher.clone();
+    let lyrics_purge = lyrics_aggregator.clone();
+    let uptime_purge = uptime_manager.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+        loop {
+            interval.tick().await;
+            let m = enricher_purge.purge_memory_cache().await;
+            let (l1, l2) = lyrics_purge.purge_memory_cache().await;
+            if m > 0 || (l1 + l2) > 0 {
+                tracing::info!(
+                    "Render ephemeral memory purge: cleared {} metadata and {} lyrics from memory. Authoritative cache preserved in Neon DB.",
+                    m, l1 + l2
+                );
+                uptime_purge.record_purge(m, l1 + l2).await;
+            }
+        }
+    });
+
     let app_state = AppState {
         enricher: metadata_enricher,
         lyrics: lyrics_aggregator,
         db: db_service,
-        start_time: Instant::now(),
+        uptime: uptime_manager,
+        start_time,
         total_song_requests: Arc::new(AtomicU64::new(0)),
         total_lyric_requests: Arc::new(AtomicU64::new(0)),
         security: security_config,
@@ -85,6 +150,12 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         // Interactive Dashboard
         .route("/", get(web::dashboard_handler))
+        // Dedicated Uptime & System Statistics Page
+        .route("/uptime", get(web::uptime_handler))
+        .route("/status", get(web::uptime_handler))
+        .route("/api/uptime/logs", get(web::uptime_logs_handler))
+        .route("/api/uptime/stats", get(web::uptime_stats_handler))
+        .route("/api/cache/purge", axum::routing::post(web::manual_purge_handler))
         // Single Song Enricher (Supports PUT & POST on both /song and /api/enrich-metadata)
         .route("/song", put(enrich_song_handler).post(enrich_song_handler))
         .route("/api/enrich-metadata", put(enrich_song_handler).post(enrich_song_handler))
